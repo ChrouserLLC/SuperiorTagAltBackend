@@ -25,11 +25,7 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
     {
         if (instance != null) return;
         GameObject go = new GameObject("PlayerTracker");
-        PlayerTracker tracker = go.AddComponent<PlayerTracker>();
-        if (string.IsNullOrEmpty(tracker.BackendBaseUrl))
-        {
-            tracker.BackendBaseUrl = GetFallbackBackendUrl();
-        }
+        go.AddComponent<PlayerTracker>();
     }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -53,31 +49,18 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
     {
         if (string.IsNullOrEmpty(BackendBaseUrl))
         {
-            BackendBaseUrl = GetFallbackBackendUrl();
+            Debug.LogError("[PlayerTracker] BackendBaseUrl is empty. Set it on the " +
+                "PlayerTracker component to the Superior Tag Alt backend (the Vercel " +
+            "URL). Tracking is disabled until you do. Note this is NOT the SisterShip " +
+                "backend, which serves /api/v1/* and has no /api/tracker route.");
+        }
+        if (string.IsNullOrEmpty(TrackerSecret))
+        {
+            Debug.LogError("[PlayerTracker] TrackerSecret is empty. Set it on the " +
+                "PlayerTracker component to the same value as the API_SECRET " +
+                "environment variable on the backend.");
         }
         StartCoroutine(CountOfPlayersLoop());
-    }
-
-    private static string GetFallbackBackendUrl()
-    {
-        // Reuse the SisterShip backend URL when the Inspector field is blank, so
-        // the tracker only needs configuring in one place.
-        // The original script reflected on a "MetaAttestationv2" type that does
-        // not exist in this project, so the fallback silently produced "" and
-        // tracking never sent anything.
-        try
-        {
-            if (SisterShip.SisterShipManager.Instance != null)
-            {
-                return SisterShip.SisterShipManager.Instance.BackendUrl ?? "";
-            }
-        }
-        catch
-        {
-            // SisterShip not present; fall through to the empty result.
-        }
-
-        return "";
     }
 
     private IEnumerator CountOfPlayersLoop()
@@ -229,6 +212,9 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
     {
         if (string.IsNullOrEmpty(TrackerSecret) || string.IsNullOrEmpty(BackendBaseUrl))
         {
+            Debug.LogWarning("[PlayerTracker] " + eventType + " dropped: BackendBaseUrl=\"" +
+                (BackendBaseUrl ?? "") + "\" TrackerSecret=\"" +
+                (string.IsNullOrEmpty(TrackerSecret) ? "<empty>" : "<set>") + "\"");
             yield break;
         }
 
@@ -262,13 +248,65 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
 
             if (request.result == UnityWebRequest.Result.Success)
             {
-                Debug.Log("[PlayerTracker] sent " + eventType + " for " + playerName);
+                // The backend reports whether the Discord webhook actually
+                // accepted the embed. Without logging this, a bad webhook URL or
+                // a cooldown rejection looks identical to success in the log.
+                string detail = SummarizeResponse(request.downloadHandler.text);
+                Debug.Log("[PlayerTracker] sent " + eventType + " for " + playerName + detail);
             }
             else
             {
                 Debug.LogWarning("[PlayerTracker] send failed: " + request.error);
             }
         }
+    }
+
+    /// <summary>Pull the webhook outcome out of the response for the log.</summary>
+    private static string SummarizeResponse(string json)
+    {
+        if (string.IsNullOrEmpty(json)) return "";
+        try
+        {
+            JsonData root = JsonMapper.ToObject(json);
+            if (root == null || !root.IsObject) return "";
+            var sb = new System.Text.StringBuilder();
+            sb.Append(" -> ");
+            AppendField(sb, root, "role");
+            AppendField(sb, root, "webhook_sent");
+            AppendField(sb, root, "vip_webhook_sent");
+            AppendField(sb, root, "webhook_error");
+            AppendField(sb, root, "vip_webhook_error");
+            AppendField(sb, root, "error");
+            return sb.ToString();
+        }
+        catch (System.Exception)
+        {
+            return "";
+        }
+    }
+
+    private static void AppendField(System.Text.StringBuilder sb, JsonData obj, string key)
+    {
+        if (obj == null || !obj.IsObject) return;
+        IDictionary dict = obj;
+        if (dict == null || !dict.Contains(key)) return;
+        JsonData value = dict[key] as JsonData;
+        if (value == null) return;
+
+        // This project's LitJson has no AsString/AsBool properties - only the
+        // IJsonWrapper getters. Fully qualify, because there is also a global
+        // IJsonWrapper stub in the project root from AssetRipper.
+        LitJson.IJsonWrapper w = value;
+        string text;
+        if (value.IsString) text = w.GetString();
+        else if (value.IsBoolean) text = w.GetBoolean() ? "true" : "false";
+        else if (value.IsInt) text = w.GetInt().ToString();
+        else if (value.IsLong) text = w.GetLong().ToString();
+        else text = value.ToJson();
+
+        if (string.IsNullOrEmpty(text)) return;
+        if (sb.Length > 4) sb.Append(", ");
+        sb.Append(key).Append("=").Append(text);
     }
 
     private string GetGameMode()

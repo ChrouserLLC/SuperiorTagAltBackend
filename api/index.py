@@ -32,17 +32,17 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "")
-PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "")
+PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "12304A")
+PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "9U76KWPK7KPWTJNBDJ5AW4MDYGZ688C4XRQZBFYI33O7NZ7HTN")
 
 # One shared secret for every client-facing endpoint. The original services each
 # had their own (REPORT_SECRET / TRACKER_SECRET); a single value means the Unity
 # side is configured once.
-API_SECRET = os.environ.get("API_SECRET", "CHANGE_ME")
+API_SECRET = os.environ.get("API_SECRET", "vqeQrzStXB1U7wpojlC8Yaewmsae6YAcs3nEXfHFUJt0co1176gPQddh4qAwdqDA")
 
-TRACKER_WEBHOOK_URL = os.environ.get("TRACKER_WEBHOOK_URL", "")
-TRACKER_VIP_WEBHOOK_URL = os.environ.get("TRACKER_VIP_WEBHOOK_URL", "")
-REPORT_WEBHOOK_URL = os.environ.get("REPORT_WEBHOOK_URL", "")
+TRACKER_WEBHOOK_URL = os.environ.get("TRACKER_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351111045447710/Tcfm53ZBDwYT21O6J898iAgwfoLTyn-UjQ_Bme4evlGYb43ECXrlKVxb3yGGpR4LRTwy")
+TRACKER_VIP_WEBHOOK_URL = os.environ.get("TRACKER_VIP_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351193568645151/7tv986Faqocmpfp0xu0m3_J4dxvYaMyKnwekz_0EljhNq0N-wz9315WRNiKFoMtegupa")
+REPORT_WEBHOOK_URL = os.environ.get("REPORT_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351283498459297/Qa4Kc3XAvM8hia7xvtlxw5SG-xBzAuSaUzz055t17DePjIw-QkeWUfb767H1PMKOhYiL")
 
 TRACKER_COOLDOWN_SECONDS = int(os.environ.get("TRACKER_COOLDOWN_SECONDS", "10"))
 REPORT_COOLDOWN_SECONDS = int(os.environ.get("REPORT_COOLDOWN_SECONDS", "15"))
@@ -810,15 +810,21 @@ def dashboard_data():
         return jsonify({"success": False, "error": "bad secret"}), 401
 
     now = time.time()
+
+    # Always read the per-player registry. Previously this returned players=[]
+    # whenever the global count was fresh - and because the client refreshes the
+    # global count every 15s against a 90s TTL, that branch was taken on nearly
+    # every request, so the player list could never render.
+    players = online_snapshot()
+    count = len(players)
+    source = "tracker_fallback"
+
     if now - _online_global_at <= ONLINE_GLOBAL_TTL_SECONDS:
-        players = []
-        count = _online_global_count
+        # The client's 15s heartbeat is the authoritative headline number; the
+        # registry is detail. Prefer whichever is higher so a lagging heartbeat
+        # cannot under-report.
+        count = max(_online_global_count, len(players))
         source = "global_count"
-        stale = False
-    else:
-        players = online_snapshot()
-        count = len(players)
-        source = "tracker_fallback"
 
     tracked = load_tracked_players()
 

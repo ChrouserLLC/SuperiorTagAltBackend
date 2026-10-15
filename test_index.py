@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 
 # The lobby bar uses block characters; a cp1252 console would crash on print.
 try:
@@ -315,6 +316,8 @@ check("dashboard data rejects a bad secret", r.status_code == 401, r.status_code
 with mod._online_lock:
     mod._online_registry.clear()
 mod._online_global_at = 0
+mod._online_global_at = 0
+mod._online_global_count = 0
 mod.touch_online("AABBCCDDEEFF00112233445566778899", "Alice")
 mod.touch_online("99887766554433221100FFEEDDCCBBAA", "Bob")
 r = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET})
@@ -331,6 +334,31 @@ check("dashboard rows default role to None",
 check("dashboard reports role counts", "tracked_counts" in d, d)
 check("dashboard flags unconfigured playfab", d.get("playfab_configured") is False, d)
 check("dashboard has a timestamp", bool(d.get("generated_at")), d)
+
+# a later event with a better name should update, not duplicate
+mod.touch_online("AABBCCDDEEFF00112233445566778899", "AliceRenamed")
+d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+check("re-touch updates the name in place", d.get("player_count") == 2, d)
+check("re-touch uses the newest name",
+      "AliceRenamed" in {p["display_name"] for p in d["players"]}, d["players"])
+
+# Regression: a fresh global count used to blank the player list entirely,
+# and because the client refreshes that count every 15s against a 90s TTL it
+# blanked on nearly every request.
+mod._online_global_at = time.time()
+mod._online_global_count = 5
+d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+check("fresh global count keeps the player list", len(d.get("players") or []) == 2, d)
+check("fresh global count is the source", d.get("source") == "global_count", d)
+check("headline prefers the higher count", d.get("online") == 5, d)
+
+mod._online_global_count = 1
+d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+check("headline never under-reports the registry", d.get("online") == 2, d)
+
+# clear the global count again so later /api/online tests exercise the registry
+mod._online_global_at = 0
+mod._online_global_count = 0
 
 # a later event with a better name should update, not duplicate
 mod.touch_online("AABBCCDDEEFF00112233445566778899", "AliceRenamed")
