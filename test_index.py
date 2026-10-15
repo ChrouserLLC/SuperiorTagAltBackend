@@ -64,8 +64,9 @@ check("playfab_configured false (no creds)", d.get("playfab_configured") is Fals
 
 r = app.get("/")
 d = r.get_json()
-check("root lists 3 features", sorted(d.get("features") or []) == ["instaban", "reports", "tracker"], d)
+check("root lists 4 features", sorted(d.get("features") or []) == ["dashboard", "instaban", "reports", "tracker"], d)
 check("root lists /api/report", "/api/report" in (d.get("endpoints") or []), d)
+check("root points at /dashboard", d.get("dashboard") == "/dashboard", d)
 
 # ---------------------------------------------------------------------------
 print("\n--- secret enforcement ---")
@@ -280,14 +281,84 @@ check("repair leaves empty lists empty",
       repaired["admins"] == [] and repaired["owners"] == [], repaired)
 
 r = app.get("/api/tracker/tracked")
-check("tracked returns 200", r.status_code == 200, r.status_code)
+check("tracked requires a secret", r.status_code == 401, r.status_code)
+
+r = app.get("/api/tracker/tracked", headers={"X-Api-Secret": SECRET})
+check("tracked accepts the header secret", r.status_code == 200, r.status_code)
 check("tracked returns 4 keys",
-      sorted(r.get_json().keys()) == ["admins", "content_creators", "moderators", "owners"],
+      sorted(k for k in r.get_json() if k != "success") == ["admins", "content_creators", "moderators", "owners"],
       r.get_json())
+
+r = app.get("/api/tracker/tracked", headers={"X-Api-Secret": "wrong"})
+check("tracked rejects a bad header secret", r.status_code == 401, r.status_code)
 
 r = app.post("/api/tracker/refresh", json=authed({}))
 check("refresh 200", r.status_code == 200, r.status_code)
 check("refresh success true", r.get_json().get("success") is True, r.get_json())
+
+# ---------------------------------------------------------------------------
+print("\n--- dashboard ---")
+r = app.get("/dashboard")
+check("dashboard page 200", r.status_code == 200, r.status_code)
+check("dashboard is html", "text/html" in (r.headers.get("Content-Type") or ""),
+      r.headers.get("Content-Type"))
+html = r.get_data(as_text=True)
+check("dashboard has a title", "<title>" in html, html[:80])
+check("dashboard does not embed the secret", "1atg9MaCMGmf" not in html, "secret found in HTML")
+
+r = app.get("/api/dashboard")
+check("dashboard data requires a secret", r.status_code == 401, r.status_code)
+
+r = app.get("/api/dashboard", headers={"X-Api-Secret": "wrong"})
+check("dashboard data rejects a bad secret", r.status_code == 401, r.status_code)
+
+with mod._online_lock:
+    mod._online_registry.clear()
+mod._online_global_at = 0
+mod.touch_online("AABBCCDDEEFF00112233445566778899", "Alice")
+mod.touch_online("99887766554433221100FFEEDDCCBBAA", "Bob")
+r = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET})
+check("dashboard data 200 with secret", r.status_code == 200, r.status_code)
+d = r.get_json()
+check("dashboard success true", d.get("success") is True, d)
+check("dashboard counts players", d.get("player_count") == 2, d)
+check("dashboard lists player rows", len(d.get("players") or []) == 2, d)
+check("dashboard rows carry playfab_id", d["players"][0].get("playfab_id"), d["players"][0])
+check("dashboard rows keep the live display name",
+      {p["display_name"] for p in d["players"]} == {"Alice", "Bob"}, d["players"])
+check("dashboard rows default role to None",
+      all(p.get("role") is None for p in d["players"]), d["players"])
+check("dashboard reports role counts", "tracked_counts" in d, d)
+check("dashboard flags unconfigured playfab", d.get("playfab_configured") is False, d)
+check("dashboard has a timestamp", bool(d.get("generated_at")), d)
+
+# a later event with a better name should update, not duplicate
+mod.touch_online("AABBCCDDEEFF00112233445566778899", "AliceRenamed")
+d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+check("re-touch updates the name in place", d.get("player_count") == 2, d)
+check("re-touch uses the newest name",
+      "AliceRenamed" in {p["display_name"] for p in d["players"]}, d["players"])
+
+# ---------------------------------------------------------------------------
+print("\n--- privacy: playfab ids must not leak unauthenticated ---")
+r = app.get("/api/online")
+check("online 200 without a secret", r.status_code == 200, r.status_code)
+check("online withholds the player list", "players" not in r.get_json(), r.get_json())
+check("online still returns a count", isinstance(r.get_json().get("online"), int), r.get_json())
+
+r = app.get("/api/online", headers={"X-Api-Secret": SECRET})
+# snapshot is sorted by id, so '9' sorts before 'A'
+check("online reveals the sorted id list to a valid secret",
+      r.get_json().get("players") == ["99887766554433221100FFEEDDCCBBAA",
+                                      "AABBCCDDEEFF00112233445566778899"],
+      r.get_json())
+
+r = app.get("/api/tracker/tracked")
+check("rosters withheld without a secret", r.status_code == 401, r.status_code)
+
+# secret must not be accepted from the query string (it would land in logs)
+r = app.get("/api/dashboard?secret=" + SECRET)
+check("query-string secret is not accepted", r.status_code == 401, r.status_code)
 
 # ---------------------------------------------------------------------------
 print("\n--- online registry ---")
@@ -325,6 +396,16 @@ check("registry empty again", r.get_json().get("online") == 0, r.get_json())
 
 check("touch_online ignores unknown key", mod.touch_online("unknown") is None
       and len(mod.online_snapshot()) == 0, mod.online_snapshot())
+
+mod.touch_online("PFKEEPNAME", "Grace")
+mod.touch_online("PFKEEPNAME")
+check("touch_online keeps an existing name when none is sent",
+      mod.online_snapshot()[0]["name"] == "Grace", mod.online_snapshot())
+mod.untouch_online("PFKEEPNAME")
+
+check("snapshot rows are sorted by id",
+      [p["playfab_id"] for p in mod.online_snapshot()] ==
+      sorted(p["playfab_id"] for p in mod.online_snapshot()), mod.online_snapshot())
 
 # ---------------------------------------------------------------------------
 print("\n--- discord payload builders ---")

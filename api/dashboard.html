@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Superior Tag Alt &middot; Dashboard</title>
+<style>
+  :root {
+    --bg:        #0d1117;
+    --panel:     #161b22;
+    --panel-2:   #1c2128;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --muted:     #8b949e;
+    --accent:    #2f81f7;
+    --ok:        #3fb950;
+    --warn:      #d29922;
+    --owner:     #a371f7;
+    --admin:     #f85149;
+    --moderator: #58a6ff;
+    --cc:        #f0b72f;
+    --radius:    10px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px 56px; }
+
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 13px; }
+
+  .spacer { flex: 1 1 auto; }
+
+  /* ---- login ---- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .login { max-width: 460px; margin: 48px auto; }
+  .login h2 { margin: 0 0 6px; font-size: 17px; }
+  .login p  { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+
+  input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+
+  button {
+    padding: 10px 16px;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border); font-weight: 500;
+  }
+  button.ghost:hover { color: var(--text); border-color: var(--muted); }
+
+  .row { display: flex; gap: 10px; align-items: flex-end; margin-top: 14px; }
+
+  .err {
+    margin-top: 12px; padding: 10px 12px;
+    background: rgba(248,81,73,.10);
+    border: 1px solid rgba(248,81,73,.4);
+    border-radius: 8px;
+    color: #ff9d96; font-size: 13px;
+  }
+
+  .note {
+    margin-top: 14px; padding: 10px 12px;
+    background: rgba(210,153,34,.10);
+    border: 1px solid rgba(210,153,34,.35);
+    border-radius: 8px;
+    color: #e3b341; font-size: 12.5px; line-height: 1.45;
+  }
+
+  /* ---- stats ---- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  .stat .v { font-size: 30px; font-weight: 650; margin-top: 6px; line-height: 1; }
+  .stat .v.small { font-size: 20px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .dot.on  { background: var(--ok);   box-shadow: 0 0 0 3px rgba(63,185,80,.18); }
+  .dot.off { background: var(--muted); }
+
+  /* ---- panels ---- */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+  .panel > h3 {
+    margin: 0; padding: 13px 16px;
+    font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted);
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .panel > h3 .count { margin-left: auto; text-transform: none; letter-spacing: 0; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  tr:last-child td { border-bottom: 0; }
+  td.mono, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 14px; }
+
+  .role {
+    display: inline-block; padding: 2px 9px;
+    border-radius: 999px; font-size: 11.5px;
+    font-weight: 650; letter-spacing: .3px;
+  }
+  .role.owner        { background: rgba(163,113,247,.16); color: var(--owner); }
+  .role.admin        { background: rgba(248,81,73,.16);  color: var(--admin); }
+  .role.moderator    { background: rgba(88,166,255,.16); color: var(--moderator); }
+  .role.content_creator { background: rgba(240,183,47,.16); color: var(--cc); }
+  .role.player       { background: rgba(139,148,158,.14); color: var(--muted); }
+
+  .hidden { display: none !important; }
+  .banner { padding: 12px 16px; font-size: 13.5px; border-bottom: 1px solid var(--border); }
+  .banner.warn { background: rgba(210,153,34,.10); color: #e3b341; }
+
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ================= LOGIN ================= -->
+  <div id="login" class="card login">
+    <h2>Dashboard access</h2>
+    <p>Enter the <code>API_SECRET</code> configured on the backend.</p>
+    <label for="secret">API secret</label>
+    <input id="secret" type="password" autocomplete="off" spellcheck="false" placeholder="paste API_SECRET">
+    <div class="row">
+      <button id="go">Unlock</button>
+    </div>
+    <div id="loginErr" class="err hidden"></div>
+    <div class="note">
+      Stored in this browser's <code>localStorage</code> so you are not retyping it.
+      This is the same value that ships inside the game client, so treat it as
+      a speed bump rather than real authentication &mdash; anyone who can open
+      devtools on the dashboard can read it.
+    </div>
+  </div>
+
+  <!-- ================= DASHBOARD ================= -->
+  <div id="app" class="hidden">
+    <header>
+      <h1>Superior Tag Alt</h1>
+      <span class="sub" id="stamp">&mdash;</span>
+      <span class="spacer"></span>
+      <span class="sub"><span id="liveDot" class="dot off"></span><span id="liveText">connecting</span></span>
+      <button class="ghost" id="refresh">Refresh</button>
+      <button class="ghost" id="lock">Lock</button>
+    </header>
+
+    <div id="pfWarn" class="note hidden" style="margin-bottom:18px;">
+      <strong>PlayFab is not configured.</strong> Player roles will all show as
+      &ldquo;Player&rdquo; because the backend cannot read the tracked-player lists.
+      Set <code>PLAYFAB_TITLE_ID</code> and <code>PLAYFAB_SECRET_KEY</code> on the backend.
+    </div>
+
+    <div id="ttlWarn" class="panel banner warn hidden">
+      Showing the client-reported global count. The per-player list is empty until
+      players start sending tracker events.
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="k">Players online</div>
+        <div class="v" id="sOnline">&mdash;</div>
+      </div>
+      <div class="stat">
+        <div class="k">In player list</div>
+        <div class="v" id="sListed">&mdash;</div>
+      </div>
+      <div class="stat">
+        <div class="k">Staff tracked</div>
+        <div class="v" id="sStaff">&mdash;</div>
+      </div>
+      <div class="stat">
+        <div class="k">Data source</div>
+        <div class="v small" id="sSource">&mdash;</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Online players <span class="count" id="pCount"></span></h3>
+      <div id="playerTable"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Tracked roles</h3>
+      <div id="roleTable"></div>
+    </div>
+
+    <footer>
+      Auto-refreshes every 15s. The online list lives in server memory, so it
+      resets whenever the host recycles &mdash; that is expected, not a bug.
+    </footer>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var KEY = "stalt.apisecret";
+  var POLL_MS = 15000;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var secret = "";
+  var timer = null;
+
+  // ---- helpers -------------------------------------------------------------
+
+  function store(v) { try { localStorage.setItem(KEY, v); } catch (e) {} }
+  function load()   { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
+  function clear()  { try { localStorage.removeItem(KEY); } catch (e) {} }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function shorten(id) {
+    if (!id) return "";
+    return id.length > 14 ? id.slice(0, 6) + "…" + id.slice(-6) : id;
+  }
+
+  function roleLabel(r) {
+    return {
+      owner: "Owner",
+      admin: "Admin",
+      moderator: "Moderator",
+      content_creator: "Content Creator"
+    }[r] || "Player";
+  }
+
+  function setLive(on, text) {
+    $("liveDot").className = "dot " + (on ? "on" : "off");
+    $("liveText").textContent = text;
+  }
+
+  // ---- data ----------------------------------------------------------------
+
+  function fetchData() {
+    return fetch("/api/dashboard", {
+      headers: { "X-Api-Secret": secret },
+      cache: "no-store"
+    }).then(function (r) {
+      if (r.status === 401) {
+        var err = new Error("Bad secret.");
+        err.unauthorized = true;
+        throw err;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function render(d) {
+    var players = d.players || [];
+    var tracked = d.tracked_counts || {};
+
+    $("sOnline").textContent = d.online;
+    $("sListed").textContent = d.player_count != null ? d.player_count : players.length;
+    $("sSource").textContent = d.source === "global_count" ? "Global" : "Tracker";
+    $("stamp").textContent = d.generated_at ? "as of " + d.generated_at : "";
+
+    var staff = (tracked.owners || 0) + (tracked.admins || 0)
+              + (tracked.moderators || 0) + (tracked.content_creators || 0);
+    $("sStaff").textContent = staff;
+
+    $("pfWarn").classList.toggle("hidden", !!d.playfab_configured);
+    $("ttlWarn").classList.toggle("hidden", d.source !== "global_count");
+
+    // players, staff first
+    players.sort(function (a, b) {
+      var order = { owner: 0, admin: 1, moderator: 2, content_creator: 3 };
+      var ra = order[a.role], rb = order[b.role];
+      ra = ra == null ? 4 : ra;
+      rb = rb == null ? 4 : rb;
+      if (ra !== rb) return ra - rb;
+      return String(a.display_name || a.playfab_id)
+             .localeCompare(String(b.display_name || b.playfab_id));
+    });
+
+    $("pCount").textContent = players.length ? "(" + players.length + ")" : "";
+
+    if (!players.length) {
+      $("playerTable").innerHTML =
+        '<div class="empty">Nobody online right now.</div>';
+    } else {
+      var rows = players.map(function (p) {
+        var who = p.display_name || shorten(p.playfab_id) || "unknown";
+        var id  = p.display_name ? esc(shorten(p.playfab_id)) : "";
+        return "<tr>"
+          + '<td>' + esc(who) + (id ? ' <span class="mono">' + id + "</span>" : "") + "</td>"
+          + '<td><span class="role ' + esc(p.role || "player") + '">'
+          + esc(roleLabel(p.role)) + "</span></td>"
+          + "</tr>";
+      }).join("");
+      $("playerTable").innerHTML =
+        "<table><thead><tr><th>Player</th><th>Role</th></tr></thead><tbody>"
+        + rows + "</tbody></table>";
+    }
+
+    // role breakdown
+    var roles = [
+      ["owner",         "Owner",           tracked.owners || 0],
+      ["admin",         "Admin",           tracked.admins || 0],
+      ["moderator",     "Moderator",       tracked.moderators || 0],
+      ["content_creator","Content Creator", tracked.content_creators || 0]
+    ];
+    $("roleTable").innerHTML =
+      "<table><thead><tr><th>Role</th><th>Tracked</th></tr></thead><tbody>"
+      + roles.map(function (r) {
+          return "<tr><td><span class=\"role " + r[0] + "\">" + esc(r[1]) + "</span></td>"
+               + "<td>" + r[2] + "</td></tr>";
+        }).join("")
+      + "</tbody></table>";
+  }
+
+  // ---- flow ----------------------------------------------------------------
+
+  function stopPolling() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  function showDashboard(d) {
+    $("login").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    render(d);
+    stopPolling();
+    timer = setInterval(function () { refresh(true); }, POLL_MS);
+  }
+
+  function showLogin(msg) {
+    stopPolling();
+    $("app").classList.add("hidden");
+    $("login").classList.remove("hidden");
+    $("loginErr").textContent = msg || "";
+    $("loginErr").classList.toggle("hidden", !msg);
+    $("secret").value = "";
+    $("secret").focus();
+  }
+
+  function refresh(quiet) {
+    fetchData().then(function (d) {
+      render(d);
+      setLive(true, "live");
+    }).catch(function (e) {
+      if (e.unauthorized) { clear(); secret = ""; showLogin("Wrong secret. Try again."); return; }
+      setLive(false, "offline");
+      if (!quiet) window.alert("Could not reach the backend: " + e.message);
+    });
+  }
+
+  function attempt(value) {
+    secret = value;
+    return fetchData().then(function (d) {
+      store(value);
+      showDashboard(d);
+      setLive(true, "live");
+    }).catch(function (e) {
+      if (e.unauthorized) { showLogin("Wrong secret. Try again."); return; }
+      throw e;
+    });
+  }
+
+  // ---- events --------------------------------------------------------------
+
+  $("go").addEventListener("click", function () {
+    var v = $("secret").value.trim();
+    if (!v) { showLogin("Enter the API secret."); return; }
+    attempt(v).catch(function (e) { showLogin("Could not reach the backend: " + e.message); });
+  });
+
+  $("secret").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("go").click();
+  });
+
+  $("refresh").addEventListener("click", function () {
+    refresh(false);
+  });
+
+  $("lock").addEventListener("click", function () {
+    clear(); secret = ""; showLogin("");
+  });
+
+  // ---- boot ----------------------------------------------------------------
+
+  var saved = load();
+  if (saved) {
+    attempt(saved).catch(function (e) {
+      showLogin("Could not reach the backend: " + e.message);
+    });
+  } else {
+    showLogin("");
+  }
+})();
+</script>
+</body>
+</html>

@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
@@ -49,12 +49,18 @@ REPORT_COOLDOWN_SECONDS = int(os.environ.get("REPORT_COOLDOWN_SECONDS", "15"))
 
 TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 
+# How long a player stays in the dashboard's per-player list without a fresh
+# event. The client only posts tracker events on join/leave, so this needs to
+# be comfortably longer than a typical session or a full lobby will drop off
+# the list while everyone is still playing. The authoritative number is the
+# global count from /api/online-count; this list is best-effort detail.
+ONLINE_PLAYER_TTL_SECONDS = int(os.environ.get("ONLINE_PLAYER_TTL_SECONDS", "900"))
+
 try:
     ROLE_EMOJIS = json.loads(os.environ.get("TRACKER_ROLE_EMOJIS", "{}"))
 except (ValueError, TypeError):
     ROLE_EMOJIS = {}
 
-ONLINE_PLAYER_TTL_SECONDS = 90
 TRACKED_CACHE_TTL_SECONDS = 60
 ONLINE_GLOBAL_TTL_SECONDS = 90
 
@@ -474,11 +480,16 @@ def build_ban_embed(instaban, body, reason):
 # Online registry
 # ---------------------------------------------------------------------------
 
-def touch_online(player_key):
+def touch_online(player_key, player_name=""):
     if not player_key or player_key == "unknown":
         return
     with _online_lock:
-        _online_registry[player_key] = time.time()
+        # Keep the display name alongside the ID. Storing only the timestamp
+        # meant the dashboard had nothing to show but truncated PlayFab IDs.
+        previous = _online_registry.get(player_key) or {}
+        previous["name"] = player_name or previous.get("name") or ""
+        previous["at"] = time.time()
+        _online_registry[player_key] = previous
 
 
 def untouch_online(player_key):
@@ -489,13 +500,18 @@ def untouch_online(player_key):
 
 
 def online_snapshot():
+    """Live players as a list of {'playfab_id', 'name'}, oldest activity pruned."""
     now = time.time()
     with _online_lock:
-        expired = [k for k, t in _online_registry.items()
-                   if now - t > ONLINE_PLAYER_TTL_SECONDS]
+        expired = [k for k, entry in _online_registry.items()
+                   if now - entry.get("at", 0) > ONLINE_PLAYER_TTL_SECONDS]
         for k in expired:
             _online_registry.pop(k, None)
-        return sorted(_online_registry.keys())
+        return sorted(
+            ({"playfab_id": k, "name": entry.get("name") or ""}
+             for k, entry in _online_registry.items()),
+            key=lambda row: row["playfab_id"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +520,21 @@ def online_snapshot():
 
 def check_secret(body):
     return (body.get("secret") or "").strip() == API_SECRET
+
+
+def check_secret_request():
+    """Auth for GET endpoints.
+
+    Accepts the secret either in the JSON body (the Unity client's convention)
+    or in an X-Api-Secret header. The header form exists so the browser
+    dashboard does not have to put the secret in a query string, where it would
+    end up in server logs and browser history.
+    """
+    body = request.get_json(silent=True) or {}
+    candidate = (body.get("secret") or "").strip()
+    if not candidate:
+        candidate = (request.headers.get("X-Api-Secret") or "").strip()
+    return bool(candidate) and candidate == API_SECRET
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +716,7 @@ def tracker():
     if "left" in event:
         untouch_online(online_key)
     else:
-        touch_online(online_key)
+        touch_online(online_key, player_name)
 
     allowed, retry_after = hit_cooldown(
         _tracker_cooldowns,
@@ -753,18 +784,90 @@ def online_count_report():
 
 @app.route("/api/online", methods=["GET"])
 def online():
+    """Public player count.
+
+    The player list holds PlayFab IDs, so it is only returned to a caller that
+    presents the secret. Previously this endpoint returned every tracked ID to
+    anyone who asked.
+    """
     now = time.time()
     if now - _online_global_at <= ONLINE_GLOBAL_TTL_SECONDS:
         return jsonify({"online": _online_global_count, "source": "global_count"})
+    players = online_snapshot()
+    if not check_secret_request():
+        return jsonify({"online": len(players), "source": "tracker_fallback"})
     return jsonify({
-        "online": len(online_snapshot()),
+        "online": len(players),
         "source": "tracker_fallback",
-        "players": online_snapshot(),
+        "players": [p["playfab_id"] for p in players],
+    })
+
+
+@app.route("/api/dashboard", methods=["GET"])
+def dashboard_data():
+    """Everything the browser dashboard renders. Secret required."""
+    if not check_secret_request():
+        return jsonify({"success": False, "error": "bad secret"}), 401
+
+    now = time.time()
+    if now - _online_global_at <= ONLINE_GLOBAL_TTL_SECONDS:
+        players = []
+        count = _online_global_count
+        source = "global_count"
+        stale = False
+    else:
+        players = online_snapshot()
+        count = len(players)
+        source = "tracker_fallback"
+
+    tracked = load_tracked_players()
+
+    role_of = {}
+    for key, role in (("owners", "owner"), ("admins", "admin"),
+                      ("moderators", "moderator"),
+                      ("content_creators", "content_creator")):
+        for entry in tracked.get(key) or []:
+            pid = entry if isinstance(entry, str) else (entry or {}).get("playFabId")
+            name = entry.get("displayName") if isinstance(entry, dict) else None
+            if pid:
+                role_of[pid] = {"role": role, "display_name": name}
+
+    rows = []
+    for entry in players:
+        pid = entry["playfab_id"]
+        info = role_of.get(pid) or {}
+        # Prefer the live display name the client just reported; fall back to the
+        # roster name if this player has one.
+        rows.append({
+            "playfab_id": pid,
+            "role": info.get("role"),
+            "display_name": entry.get("name") or info.get("display_name"),
+        })
+    rows.sort(key=lambda r: (r["role"] is None, r["role"] or "",
+                             (r["display_name"] or r["playfab_id"]).lower()))
+
+    return jsonify({
+        "success": True,
+        "online": count,
+        "source": source,
+        "player_count": len(players),
+        "players": rows,
+        "tracked_counts": {
+            "owners": len(tracked.get("owners") or []),
+            "admins": len(tracked.get("admins") or []),
+            "moderators": len(tracked.get("moderators") or []),
+            "content_creators": len(tracked.get("content_creators") or []),
+        },
+        "playfab_configured": bool(PLAYFAB_TITLE_ID and PLAYFAB_SECRET_KEY),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
 
 
 @app.route("/api/tracker/tracked", methods=["GET"])
 def tracked():
+    """The role rosters. Secret required - these list named players by ID."""
+    if not check_secret_request():
+        return jsonify({"success": False, "error": "bad secret"}), 401
     data = load_tracked_players(force=True)
     return jsonify({
         "content_creators": data.get("content_creators") or [],
@@ -804,13 +907,25 @@ def health():
 def home():
     return jsonify({
         "service": "SuperiorTagAlt",
-        "features": ["tracker", "reports", "instaban"],
+        "features": ["tracker", "reports", "instaban", "dashboard"],
         "endpoints": [
             "/api/report", "/api/tracker", "/api/online-count",
-            "/api/online", "/api/tracker/tracked", "/api/tracker/refresh",
-            "/api/health",
+            "/api/online", "/api/dashboard", "/api/tracker/tracked",
+            "/api/tracker/refresh", "/api/health",
         ],
+        "dashboard": "/dashboard",
     })
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard_page():
+    """The browser dashboard. The HTML itself is public; the data is not."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    if not os.path.exists(path):
+        return jsonify({"success": False, "error": "dashboard.html missing"}), 500
+    with open(path, "r", encoding="utf-8") as handle:
+        html = handle.read()
+    return Response(html, mimetype="text/html")
 
 
 if __name__ == "__main__":
