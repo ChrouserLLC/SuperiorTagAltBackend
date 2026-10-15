@@ -272,6 +272,11 @@ def lookup_role(playfab_id):
 # Discord
 # ---------------------------------------------------------------------------
 
+DISCORD_USER_AGENT = os.environ.get(
+    "DISCORD_USER_AGENT",
+    "SuperiorTagAlt/1.0 (+https://superiortagaltbackend.vercel.app)")
+
+
 def post_webhook(url, payload):
     if not url:
         return False, "unset"
@@ -282,7 +287,14 @@ def post_webhook(url, payload):
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method="POST",
-            headers={"Content-Type": "application/json"})
+            headers={
+                "Content-Type": "application/json",
+                # Required. Without an explicit User-Agent, urllib sends
+                # "Python-urllib/3.x", and Discord's Cloudflare fingerprinting
+                # rejects it with HTTP 403 error code 1010 ("banned based on
+                # your browser's signature"). Every embed silently failed.
+                "User-Agent": DISCORD_USER_AGENT,
+            })
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status in (200, 204), "status {0}".format(resp.status)
     except urllib.error.HTTPError as e:

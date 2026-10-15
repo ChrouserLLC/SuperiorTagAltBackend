@@ -141,6 +141,16 @@ allowlists are what actually prevent a ban.
 
 ### Endpoints that expose player data
 
+Discord needs an explicit User-Agent. Without one, urllib sends
+`Python-urllib/3.12` and Discord's Cloudflare rejects it with **HTTP 403 error
+1010**, so every embed fails silently while `/api/health` still reports the
+webhook as configured. `DISCORD_USER_AGENT` overrides the default.
+
+`/api/health` only checks that the webhook variables are **non-empty**. It does
+not verify the URL is reachable or that Discord accepts it, so it is not proof
+the embeds work. The real signal is `webhook_sent` in the `/api/tracker`
+response, which `PlayerTracker` now prints to the Unity console.
+
 These return PlayFab IDs and were open to anyone before this was fixed:
 
 - `GET /api/online` returned the full player list unauthenticated. It now

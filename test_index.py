@@ -443,6 +443,32 @@ check("post_webhook with a URL missing its scheme fails cleanly, no raise",
 check("post_webhook with a non-http scheme fails cleanly, no raise",
       mod.post_webhook("ftp://example.invalid/x", {})[0] is False)
 
+# Regression: Discord answers HTTP 403 error 1010 ("banned based on your
+# browser's signature") when the request carries Python's default urllib
+# User-Agent, so every embed silently failed while /api/health still reported
+# the webhook as configured.
+check("post_webhook sends a non-default User-Agent",
+      "Python-urllib" not in mod.DISCORD_USER_AGENT
+      and len(mod.DISCORD_USER_AGENT) > 0, mod.DISCORD_USER_AGENT)
+
+captured = {}
+
+
+def _capture_request(request, timeout=None):
+    captured["ua"] = request.get_header("User-agent")
+    raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+
+
+_real_urlopen = mod.urllib.request.urlopen
+mod.urllib.request.urlopen = _capture_request
+try:
+    mod.post_webhook("https://discord.com/api/webhooks/1/2", {"content": "x"})
+finally:
+    mod.urllib.request.urlopen = _real_urlopen
+
+check("post_webhook puts the User-Agent on the wire",
+      captured.get("ua") == mod.DISCORD_USER_AGENT, captured)
+
 ban_emb = mod.build_ban_embed({"hours": 24}, {"reported_name": "Bob", "reported_id": "PFBOB",
                                                "reporter_name": "Alice"}, "Toxicity")["embeds"][0]
 check("ban embed title", ban_emb.get("title") == "INSTA-BAN", ban_emb.get("title"))
