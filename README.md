@@ -8,6 +8,7 @@ merged PlayFab CloudScript and the Unity client scripts that talk to them.
 | **Player tracker** | Lobby join/leave, player join/leave, online counts -> Discord | `POST /api/tracker`, `POST /api/online-count` |
 | **Custom reports** | In-game report -> moderation channel | `POST /api/report` |
 | **Insta-ban** | A report can trigger a PlayFab ban via CloudScript | runs inside `/api/report` |
+| **Redeem codes** | In-game REDEEM tab -> PlayFab catalog item | `POST /api/redeem`, `GET/POST /api/redeem-codes` |
 | **Dashboard** | Browser view of who is online and who is staff | `GET /dashboard`, `GET /api/dashboard` |
 
 Originally three separate Vercel projects (`Custom Reports`, `Custom Player
@@ -113,6 +114,89 @@ config point for the whole integration.
 no scene object.
 
 Set `ReportSecret` / `TrackerSecret` to the same value as `API_SECRET`.
+
+The REDEEM tab lives in `GorillaComputer` (scene object), not a separate script.
+Its `redeemSecret` field is optional — leave it empty and it falls back to
+`ReportSender.ReportSecret`, so there is only one place to configure.
+
+---
+
+## Redeem codes
+
+The in-game **REDEEM** tab POSTs to `/api/redeem`. The client never decides what
+a code is worth; the table lives server-side in PlayFab TitleData under
+`RedeemCodes`, so you can add or change codes without redeploying.
+
+### Code table format
+
+```json
+{
+  "BETA": {
+    "reward_type":  "cosmetic",
+    "reward_id":    "LBAAA",
+    "reward_label": "BETA TESTER",
+    "credits":      0,
+    "max_uses":     0,
+    "enabled":      true,
+    "note":         "internal note, never shown to players"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `reward_id` | **The important one.** A PlayFab catalog `ItemId`. Granted via `GrantCatalogItem`. |
+| `reward_label` | What the player is shown in-game. Defaults to `reward_id`. |
+| `reward_type` | `cosmetic` or `credits`. GorillaNetworking has no separate currency, so `credits` is also just a catalog item. |
+| `credits` | Display only, when `reward_type` is `credits`. |
+| `max_uses` | Times **one player** may redeem it. `0` = unlimited. |
+| `enabled` | `false` retires the code without deleting it. |
+
+A string value is accepted as shorthand: `"BETA": "LBAAA"`.
+
+### Managing codes
+
+```bash
+# Create or update (merges into the existing entry)
+curl -X POST https://<domain>/api/redeem-codes \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"<API_SECRET>","code":"BETA","reward_id":"LBAAA","reward_label":"Beta Tester"}'
+
+# List
+curl https://<domain>/api/redeem-codes -H 'X-Api-Secret: <API_SECRET>'
+
+# Disable
+curl -X POST https://<domain>/api/redeem-codes \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"<API_SECRET>","code":"BETA","enabled":false}'
+
+# Delete
+curl -X POST https://<domain>/api/redeem-codes \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"<API_SECRET>","code":"BETA","delete":true}'
+```
+
+Codes are case-insensitive; everything is stored upper-cased.
+
+### How "already used" is tracked
+
+The player's redeemed codes are written to that player's **private UserData**
+under `RedeemUsed`, not to TitleData. One shared TitleData value would grow
+without bound and eventually hit PlayFab's value-size cap, silently losing
+redemption history.
+
+### Failure behaviour
+
+If `GrantCatalogItem` fails (bad item id, unknown player, PlayFab down) the
+endpoint returns **502** and the code is **not** marked as spent, so the player
+can retry. Only a successful grant burns the code. The underlying PlayFab error
+is printed to the server log and returned in the JSON `error` field.
+
+### Limits
+
+PlayFab caps a TitleData value at 4000 bytes, so the whole code table must stay
+under that. The endpoint refuses to save a larger table rather than letting
+PlayFab truncate it into unparseable JSON.
 
 ---
 

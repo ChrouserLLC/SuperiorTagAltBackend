@@ -497,6 +497,193 @@ check("report reports webhook_sent false", r.get_json().get("webhook_sent") is F
 mod.TRACKER_WEBHOOK_URL, mod.TRACKER_VIP_WEBHOOK_URL, mod.REPORT_WEBHOOK_URL = _saved
 
 # ---------------------------------------------------------------------------
+print("\n--- redeem codes ---")
+# PlayFab is stubbed entirely, so these tests exercise the redeem logic without
+# touching the real backend.
+
+# The redeem cooldown is per player+code and is 5s; tests fire back to back, so
+# clear it before each call rather than sleeping.
+def redeem(payload):
+    mod._redeem_cooldowns.clear()
+    return app.post("/api/redeem", json=authed(payload))
+
+
+check("code table: string shorthand becomes a cosmetic",
+      mod._normalise_code_table({"BETA": "LBAAA"}).get("BETA", {}).get("reward_id") == "LBAAA",
+      mod._normalise_code_table({"BETA": "LBAAA"}))
+
+check("code table: keys are upper-cased",
+      "BETA" in mod._normalise_code_table({"bEtA": "LBAAA"}),
+      list(mod._normalise_code_table({"bEtA": "LBAAA"}).keys()))
+
+check("code table: label falls back to the item id",
+      mod._normalise_code_table({"BETA": {"reward_id": "LBAAA"}})["BETA"]["reward_label"] == "LBAAA")
+
+check("code table: no reward id and no credits disables the code",
+      mod._normalise_code_table({"BETA": {"reward_label": "nothing"}})["BETA"]["enabled"] is False)
+
+check("code table: credits alone keeps the code enabled",
+      mod._normalise_code_table({"BETA": {"credits": 500}})["BETA"]["enabled"] is True)
+
+check("code table: unknown reward_type falls back to cosmetic",
+      mod._normalise_code_table({"BETA": {"reward_type": "gold", "reward_id": "L"}})["BETA"]["reward_type"] == "cosmetic")
+
+check("code table: malformed json yields an empty table",
+      mod._normalise_code_table("{not json") == {})
+
+check("code table: non-dict entry is skipped, not fatal",
+      mod._normalise_code_table({"BETA": 7, "GAMMA": "LBAAA"}).get("GAMMA", {}).get("reward_id") == "LBAAA")
+
+r = app.post("/api/redeem", json={"secret": "wrong", "code": "BETA", "playfab_id": "PF1"})
+check("redeem rejects a bad secret", r.status_code == 401, r.status_code)
+
+r = redeem({"code": "", "playfab_id": "PF1"})
+check("redeem rejects an empty code", r.status_code == 400, r.status_code)
+
+r = redeem({"code": "BETA", "playfab_id": ""})
+check("redeem rejects a missing playfab id", r.status_code == 400, r.status_code)
+check("redeem tells the player to sign in",
+      "SIGN IN" in (r.get_json().get("message") or ""), r.get_json())
+
+r = redeem({"code": "DOESNOTEXIST", "playfab_id": "PF1"})
+check("redeem rejects an unknown code", r.get_json().get("success") is False, r.get_json())
+check("redeem reports an unknown code in the message",
+      "NOT RECOGNISED" in (r.get_json().get("message") or ""), r.get_json())
+
+
+# --- fake PlayFab, so the grant path is exercised end to end ---------------
+class _FakePlayFab(object):
+    def __init__(self, codes, grant_ok=True):
+        self.codes = dict(codes)
+        self.grant_ok = grant_ok
+        self.user_data = {}
+        self.grants = []
+
+    def __call__(self, path, body):
+        if path == "GetTitleData":
+            return True, {"data": {"Data": {"RedeemCodes": json.dumps(self.codes)}}}
+        if path == "SetTitleData":
+            self.codes = json.loads(body["Value"])
+            return True, {}
+        if path == "GetUserData":
+            value = self.user_data.get(body["PlayFabId"])
+            return True, {"data": {"Data": {"RedeemUsed": value} if value else {}}}
+        if path == "UpdateUserData":
+            self.user_data[body["PlayFabId"]] = body["Data"]["RedeemUsed"]
+            return True, {}
+        if path == "GrantCatalogItem":
+            if not self.grant_ok:
+                return False, {"errorMessage": "Entity not found"}
+            self.grants.append((body["PlayFabId"], body["ItemId"]))
+            return True, {}
+        return False, {"errorMessage": "unexpected call " + str(path)}
+
+
+_real_pf = mod.pf_request
+_real_webhook = mod.REDEEM_WEBHOOK_URL
+mod.REDEEM_WEBHOOK_URL = ""
+
+
+def use_fake(codes, grant_ok=True):
+    """Swap in a fake PlayFab and drop the cached code table.
+
+    The 30s code-table cache is deliberate (it stops every redeem hammering
+    TitleData), so a test that changes the table has to invalidate it too.
+    """
+    fake = _FakePlayFab(codes, grant_ok=grant_ok)
+    mod.pf_request = fake
+    mod._redeem_codes_cache = None
+    mod._redeem_codes_cache_at = 0.0
+    return fake
+
+
+fake = use_fake({"BETA": {"reward_id": "LBAAA", "reward_label": "Beta Tester"}})
+
+r = redeem({"code": "beta", "playfab_id": "PF1"})
+d = r.get_json()
+check("redeem accepts a lowercase code", d.get("success") is True, d)
+check("redeem reports the reward label", d.get("reward_label") == "Beta Tester", d)
+check("redeem reports the reward id", d.get("reward_id") == "LBAAA", d)
+check("redeem granted the catalog item", fake.grants == [("PF1", "LBAAA")], fake.grants)
+
+r = redeem({"code": "BETA", "playfab_id": "PF1"})
+check("redeem blocks a second use of the same code",
+      "ALREADY" in (r.get_json().get("message") or ""), r.get_json())
+check("a repeat attempt does not grant again", len(fake.grants) == 1, fake.grants)
+
+r = redeem({"code": "BETA", "playfab_id": "PF2"})
+check("another player can still redeem the same code", r.get_json().get("success") is True, r.get_json())
+
+# --- a failed grant must not burn the code -------------------------------
+broken = use_fake({"BETA": {"reward_id": "LBAAA"}}, grant_ok=False)
+r = redeem({"code": "BETA", "playfab_id": "PF3"})
+check("a failed grant returns 502", r.status_code == 502, r.status_code)
+check("a failed grant surfaces the PlayFab error",
+      r.get_json().get("error") == "Entity not found", r.get_json())
+check("a failed grant does not mark the code used", "PF3" not in broken.user_data, broken.user_data)
+
+use_fake({"BETA": {"reward_id": "LBAAA"}})
+r = redeem({"code": "BETA", "playfab_id": "PF3"})
+check("the same code works after the failure clears", r.get_json().get("success") is True, r.get_json())
+
+# --- max_uses -------------------------------------------------------------
+# --- max_uses is per player ----------------------------------------------
+limited = use_fake({"TWICE": {"reward_id": "LBAAA", "max_uses": 2}})
+check("max_uses allows the first claim", redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json().get("success") is True)
+check("max_uses allows the second claim", redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json().get("success") is True)
+third = redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json()
+check("max_uses stops a third claim",
+      third.get("success") is False and "ALREADY" in (third.get("message") or ""), third)
+check("max_uses granted exactly twice", len(limited.grants) == 2, limited.grants)
+check("max_uses does not affect other players",
+      redeem({"code": "TWICE", "playfab_id": "PFB"}).get_json().get("success") is True)
+
+# --- default is strictly one reward per player ---------------------------
+once = use_fake({"ONCE": {"reward_id": "LBAAA"}})
+check("default code: first claim succeeds", redeem({"code": "ONCE", "playfab_id": "PFA"}).get_json().get("success") is True)
+again = redeem({"code": "ONCE", "playfab_id": "PFA"}).get_json()
+check("default code: second claim is refused",
+      again.get("success") is False and "ALREADY" in (again.get("message") or ""), again)
+check("default code: granted exactly once", len(once.grants) == 1, once.grants)
+
+# --- admin code management ------------------------------------------------
+mod.pf_request = use_fake({})
+r = app.post("/api/redeem-codes", json=authed({"code": "gama", "reward_id": "LFG1", "reward_label": "Gamer"}))
+check("upsert creates a code", r.get_json().get("success") is True, r.get_json())
+check("upsert upper-cases the code", "GAMA" in r.get_json().get("codes", {}), r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "reward_label": "Gamer 2"}))
+check("upsert merges without dropping the item id",
+      r.get_json()["codes"]["GAMA"]["reward_id"] == "LFG1", r.get_json())
+check("upsert updates the label",
+      r.get_json()["codes"]["GAMA"]["reward_label"] == "Gamer 2", r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed({"code": "EMPTY", "reward_label": "nothing"}))
+check("upsert refuses a code with no reward", r.status_code == 400, r.status_code)
+
+check("list rejects a missing secret", app.get("/api/redeem-codes").status_code == 401)
+r = app.get("/api/redeem-codes", headers={"X-Api-Secret": SECRET})
+check("list returns the table", r.get_json().get("success") is True, r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "delete": True}))
+check("delete removes the code", "GAMA" not in r.get_json().get("codes", {}), r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "delete": True}))
+check("deleting an unknown code 404s", r.status_code == 404, r.status_code)
+
+r = app.post("/api/redeem-codes", json={"secret": "wrong", "code": "X"})
+check("upsert rejects a bad secret", r.status_code == 401, r.status_code)
+
+mod.REDEEM_CODES_MAX_BYTES = 10
+r = app.post("/api/redeem-codes", json=authed({"code": "BIG", "reward_id": "L" * 500}))
+check("an oversized code table is refused", r.status_code == 502, r.status_code)
+mod.REDEEM_CODES_MAX_BYTES = 3800
+
+mod.pf_request = _real_pf
+mod.REDEEM_WEBHOOK_URL = _real_webhook
+mod._redeem_cooldowns.clear()
+
+# ---------------------------------------------------------------------------
 print("\n--- result ---")
 print("  passed: {0}   failed: {1}".format(passed, failed))
 if failed:

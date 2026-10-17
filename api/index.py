@@ -7,6 +7,7 @@ One combined Flask service providing:
   * Player tracking  (lobby join/leave, online counts, Discord embeds)
   * Player reports   (in-game report -> Discord moderation channel)
   * Insta-ban        (report can trigger a PlayFab ban via CloudScript)
+  * Redeem codes     (in-game REDEEM tab -> PlayFab catalog item)
 
 Original work, merged from three separate single-purpose services into one
 deployment. All three previously deployed to different Vercel projects and
@@ -55,6 +56,18 @@ TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 # the list while everyone is still playing. The authoritative number is the
 # global count from /api/online-count; this list is best-effort detail.
 ONLINE_PLAYER_TTL_SECONDS = int(os.environ.get("ONLINE_PLAYER_TTL_SECONDS", "900"))
+
+# Redeem codes live in TitleData so they can be added or changed without a
+# redeploy. The seed table below is only used until TitleData has a value.
+REDEEM_CODES_KEY = os.environ.get("REDEEM_CODES_KEY", "RedeemCodes")
+# Which codes a player has already spent. Stored in the player's own private
+# UserData rather than TitleData: one shared TitleData value would grow forever
+# and eventually hit the TitleData size cap, silently losing redemption history.
+REDEEM_USED_KEY = os.environ.get("REDEEM_USED_KEY", "RedeemUsed")
+REDEEM_COOLDOWN_SECONDS = int(os.environ.get("REDEEM_COOLDOWN_SECONDS", "5"))
+REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "")
+REDEEM_CODES_SEED = os.environ.get("REDEEM_CODES_JSON", "")
+REDEEM_CODES_CACHE_TTL_SECONDS = 30
 
 try:
     ROLE_EMOJIS = json.loads(os.environ.get("TRACKER_ROLE_EMOJIS", "{}"))
@@ -156,11 +169,14 @@ _tracked_cache = None
 _tracked_cache_at = 0.0
 _tracker_cooldowns = {}
 _report_cooldowns = {}
+_redeem_cooldowns = {}
 _cooldown_lock = threading.Lock()
 _online_registry = {}
 _online_lock = threading.Lock()
 _online_global_count = 0
 _online_global_at = 0.0
+_redeem_codes_cache = None
+_redeem_codes_cache_at = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +793,342 @@ def tracker():
         "vip_webhook_error": err_vip,
         "lobby": "{0}/{1}".format(player_count, max_players),
     })
+
+
+# ---------------------------------------------------------------------------
+# Redeem codes
+# ---------------------------------------------------------------------------
+#
+# The code table is a JSON object keyed by the upper-cased code:
+#
+#   {
+#     "BETA": {
+#       "reward_type":  "cosmetic",     # cosmetic | credits
+#       "reward_id":    "LBAAA",        # PlayFab catalog ItemId
+#       "reward_label": "BETA TESTER",  # shown to the player
+#       "credits":      0,              # display only when reward_type is credits
+#       "max_uses":     0,              # 0 = unlimited per player
+#       "enabled":      true,
+#       "note":         ""              # never shown to players, for you
+#     }
+#   }
+#
+# There is no separate currency in GorillaNetworking - cosmetics are PlayFab
+# catalog items, so "credits" is also just a catalog ItemId and grant_cosmetic()
+# stays the single write path. reward_id is the thing that actually matters;
+# credits/label are only what the player is shown.
+
+REDEEM_REWARD_TYPES = ("cosmetic", "credits")
+
+# PlayFab caps a TitleData value at 4000 bytes. Refuse to save past that rather
+# than letting PlayFab silently truncate the table into unparseable JSON.
+REDEEM_CODES_MAX_BYTES = 3800
+
+
+def _normalise_code_table(raw):
+    """Coerce whatever is in TitleData into {CODE: entry} with sane defaults."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    table = {}
+    for code, entry in raw.items():
+        if not isinstance(code, str):
+            continue
+        code = code.strip().upper()
+        if not code:
+            continue
+        if isinstance(entry, str):
+            # Shorthand: "BETA": "LBAAA"
+            entry = {"reward_type": "cosmetic", "reward_id": entry}
+        if not isinstance(entry, dict):
+            continue
+
+        reward_type = str(entry.get("reward_type") or "cosmetic").strip().lower()
+        if reward_type not in REDEEM_REWARD_TYPES:
+            reward_type = "cosmetic"
+        reward_id = str(entry.get("reward_id") or "").strip()
+        try:
+            credits = int(entry.get("credits") or 0)
+        except (TypeError, ValueError):
+            credits = 0
+        try:
+            max_uses = int(entry.get("max_uses") or 0)
+        except (TypeError, ValueError):
+            max_uses = 0
+
+        table[code] = {
+            "reward_type": reward_type,
+            "reward_id": reward_id,
+            "reward_label": str(entry.get("reward_label") or reward_id or code).strip(),
+            "credits": max(0, credits),
+            "max_uses": max(0, max_uses),
+            "enabled": bool(entry.get("enabled", True)) and (bool(reward_id) or credits > 0),
+            "note": str(entry.get("note") or ""),
+        }
+    return table
+
+
+def load_redeem_codes(force=False):
+    global _redeem_codes_cache, _redeem_codes_cache_at
+    now = time.time()
+    if (not force and _redeem_codes_cache is not None
+            and now - _redeem_codes_cache_at <= REDEEM_CODES_CACHE_TTL_SECONDS):
+        return _redeem_codes_cache
+
+    table = {}
+    ok, result = pf_request("GetTitleData", {})
+    if ok:
+        value = ((result.get("data") or {}).get("Data") or {}).get(REDEEM_CODES_KEY)
+        table = _normalise_code_table(value)
+    if not table:
+        # TitleData not set yet (fresh title, or a PlayFab hiccup). Fall back to
+        # the env seed so a code baked into the deployment still works.
+        table = _normalise_code_table(REDEEM_CODES_SEED)
+
+    _redeem_codes_cache = table
+    _redeem_codes_cache_at = now
+    if not table:
+        # Do NOT cache an empty result. It means TitleData has no table yet or
+        # PlayFab was briefly unreachable, and caching that would serve "no
+        # codes" to every player for the whole TTL even after a code is added
+        # or PlayFab recovers.
+        _redeem_codes_cache_at = 0.0
+    return table
+
+
+def save_redeem_codes(table):
+    encoded = json.dumps(table)
+    if len(encoded.encode("utf-8")) > REDEEM_CODES_MAX_BYTES:
+        return False, {"errorMessage": "code table is too large for TitleData"}
+    ok, result = pf_request("SetTitleData", {
+        "Key": REDEEM_CODES_KEY,
+        "Value": encoded,
+    })
+    load_redeem_codes(force=True)
+    return ok, result
+
+
+def get_player_redeemed(playfab_id):
+    """Codes this player has already spent. Never raises."""
+    if not playfab_id:
+        return []
+    ok, result = pf_request("GetUserData", {
+        "PlayFabId": playfab_id,
+        "Keys": [REDEEM_USED_KEY],
+    })
+    if not ok:
+        return []
+    value = ((result.get("data") or {}).get("Data") or {}).get(REDEEM_USED_KEY)
+    if not value:
+        return []
+    try:
+        value = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip().upper() for v in value]
+
+
+def mark_player_redeemed(playfab_id, code, already_used):
+    used = list(already_used)
+    # Append unconditionally: a code with max_uses > 1 is meant to appear more
+    # than once, and the duplicate is what the limit is counted against.
+    used.append(code)
+    ok, result = pf_request("UpdateUserData", {
+        "PlayFabId": playfab_id,
+        "Data": {REDEEM_USED_KEY: json.dumps(used)},
+        "Permission": "Private",
+    })
+    return ok, result
+
+
+def grant_cosmetic(playfab_id, item_id):
+    """Give a PlayFab catalog item. Never raises."""
+    if not playfab_id or not item_id:
+        return False, {"errorMessage": "playfab_id and item_id required"}
+    return pf_request("GrantCatalogItem", {
+        "PlayFabId": playfab_id,
+        "ItemId": item_id,
+        "Labels": ["redeem"],
+    })
+
+
+def build_redeem_embed(code, entry, playfab_id, granted):
+    fields = [
+        {"name": "Code", "value": "`{0}`".format(code[:64]), "inline": True},
+        {"name": "Reward", "value": (entry.get("reward_label") or "-")[:100], "inline": True},
+        {"name": "Type", "value": entry.get("reward_type", "cosmetic"), "inline": True},
+    ]
+    if entry.get("reward_id"):
+        fields.append({
+            "name": "Item Id",
+            "value": "`{0}`".format(entry["reward_id"][:64]),
+            "inline": True,
+        })
+    if entry.get("credits"):
+        fields.append({"name": "Credits", "value": str(entry["credits"]), "inline": True})
+    fields.append({
+        "name": "PlayFab ID",
+        "value": "`{0}`".format((playfab_id or "Unknown")[:64]),
+        "inline": False,
+    })
+    return {"embeds": [{
+        "title": "Code Redeemed" if granted else "Code Rejected",
+        "description": "`{0}` redeemed by `{1}`".format(code[:64], (playfab_id or "Unknown")[:40]),
+        "color": 0x4ADE80 if granted else 0xFF453A,
+        "fields": fields,
+        "footer": {"text": "Superior Tag Alt"},
+    }]}
+
+
+def _redeem_reject(message, status=200, error=None):
+    payload = {
+        "success": False,
+        "message": message,
+        "reward_type": "",
+        "reward_id": "",
+        "reward_label": "",
+        "credits": 0,
+    }
+    if error:
+        payload["error"] = str(error)[:200]
+    return jsonify(payload), status
+
+
+@app.route("/api/redeem", methods=["POST"])
+def redeem():
+    """A player entered a code on the in-game REDEEM tab."""
+    body = request.get_json(silent=True) or {}
+    if not check_secret(body):
+        return jsonify({"success": False, "message": "UNAUTHORISED."}), 401
+
+    code = str(body.get("code") or "").strip().upper()
+    playfab_id = str(body.get("playfab_id") or "").strip()
+    platform = str(body.get("platform") or "").strip()
+
+    if not code:
+        return _redeem_reject("TYPE A CODE FIRST.", 400)
+    if not playfab_id:
+        # No PlayFab ID means no account to grant to and nowhere to record that
+        # the code was spent. Refuse rather than grant to nobody.
+        return _redeem_reject("SIGN IN BEFORE REDEEMING A CODE.", 400)
+
+    allowed, retry_after = hit_cooldown(
+        _redeem_cooldowns, "{0}|{1}".format(playfab_id, code),
+        REDEEM_COOLDOWN_SECONDS)
+    if not allowed:
+        return _redeem_reject(
+            "WAIT {0} SECONDS AND TRY AGAIN.".format(retry_after), 429)
+
+    table = load_redeem_codes()
+    entry = table.get(code)
+    if not entry:
+        return _redeem_reject("CODE NOT RECOGNISED.")
+    if not entry.get("enabled"):
+        return _redeem_reject("THAT CODE IS NO LONGER ACTIVE.")
+
+    already_used = get_player_redeemed(playfab_id)
+    already_count = already_used.count(code)
+    max_uses = entry.get("max_uses", 0)
+    if max_uses:
+        # max_uses is per player: they may claim the reward that many times.
+        if already_count >= max_uses:
+            return _redeem_reject("YOU HAVE ALREADY USED THAT CODE.")
+    elif code in already_used:
+        # Default: strictly one reward per player per code.
+        return _redeem_reject("YOU HAVE ALREADY USED THAT CODE.")
+
+    if entry.get("reward_id"):
+        granted, grant_error = grant_cosmetic(playfab_id, entry["reward_id"])
+        if not granted:
+            # Deliberately do NOT burn the code here: the grant failed, so the
+            # player should be able to retry once PlayFab is reachable.
+            detail = (grant_error or {}).get("errorMessage") or "grant failed"
+            print("[redeem] grant failed for {0} -> {1}: {2}".format(
+                code, playfab_id, detail))
+            return _redeem_reject(
+                "COULD NOT GRANT THE REWARD. TRY AGAIN LATER.", 502, detail)
+
+    # Record the spend only after the grant succeeded, so a failed grant stays
+    # retryable.
+    mark_player_redeemed(playfab_id, code, already_used)
+
+    webhook_sent, webhook_error = post_webhook(
+        REDEEM_WEBHOOK_URL,
+        build_redeem_embed(code, entry, playfab_id, True))
+
+    return jsonify({
+        "success": True,
+        "message": "CODE ACCEPTED.",
+        "code": code,
+        "reward_type": entry.get("reward_type", "cosmetic"),
+        "reward_id": entry.get("reward_id", ""),
+        "reward_label": entry.get("reward_label", ""),
+        "credits": entry.get("credits", 0),
+        "platform": platform,
+        "webhook_sent": webhook_sent,
+        "webhook_error": webhook_error,
+    })
+
+
+@app.route("/api/redeem-codes", methods=["GET"])
+def redeem_codes_list():
+    if not check_secret_request():
+        return jsonify({"success": False, "error": "bad secret"}), 401
+    return jsonify({
+        "success": True,
+        "codes": load_redeem_codes(force=True),
+    })
+
+
+@app.route("/api/redeem-codes", methods=["POST"])
+def redeem_codes_upsert():
+    """Add, edit, disable or delete a code. Merges into the existing entry."""
+    body = request.get_json(silent=True) or {}
+    if not check_secret(body):
+        return jsonify({"success": False, "error": "bad secret"}), 401
+
+    code = str(body.get("code") or "").strip().upper()
+    if not code:
+        return jsonify({"success": False, "error": "code required"}), 400
+
+    table = load_redeem_codes(force=True)
+
+    if body.get("delete"):
+        if code not in table:
+            return jsonify({"success": False, "error": "unknown code"}), 404
+        table.pop(code, None)
+    else:
+        merged = dict(table.get(code) or {})
+        for key in ("reward_type", "reward_id", "reward_label", "note", "enabled"):
+            if key in body:
+                merged[key] = body[key]
+        for key in ("credits", "max_uses"):
+            if key in body:
+                merged[key] = body[key]
+
+        normalised = _normalise_code_table({code: merged}).get(code)
+        if not normalised or not normalised.get("enabled"):
+            return jsonify({
+                "success": False,
+                "error": "invalid code - needs reward_id or a credits amount",
+            }), 400
+        table[code] = normalised
+
+    ok, result = save_redeem_codes(table)
+    if not ok:
+        return jsonify({
+            "success": False,
+            "error": (result or {}).get("errorMessage") or "could not save",
+        }), 502
+
+    return jsonify({"success": True, "code": code, "codes": table})
 
 
 @app.route("/api/online-count", methods=["POST"])
