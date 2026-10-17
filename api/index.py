@@ -57,6 +57,13 @@ TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 # global count from /api/online-count; this list is best-effort detail.
 ONLINE_PLAYER_TTL_SECONDS = int(os.environ.get("ONLINE_PLAYER_TTL_SECONDS", "900"))
 
+# Redeem log: a rolling window of the most recent redemptions in TitleData so
+# there is something to look at after the fact. Capped, because a TitleData
+# value is capped at 4000 bytes. Vercel's own logs hold the full history.
+REDEEM_LOG_KEY = os.environ.get("REDEEM_LOG_KEY", "RedeemLog")
+REDEEM_LOG_MAX_ENTRIES = int(os.environ.get("REDEEM_LOG_MAX_ENTRIES", "25"))
+REDEEM_LOG_MAX_BYTES = 3600
+
 # Redeem: which cosmetics are redeemable comes from catalog TAGS
 # (redeem:CODE), not from here. The table below only holds per-code settings
 # and currency rewards, so a code can be turned off or annotated without
@@ -1126,18 +1133,42 @@ def mark_player_redeemed(playfab_id, code, already_used):
 # --- grants ---------------------------------------------------------------
 
 def grant_cosmetic(playfab_id, item_id):
-    """Give a PlayFab catalog item. Never raises."""
+    """Give a PlayFab catalog item. Never raises.
+
+    Uses GrantItemsToUser, NOT GrantCatalogItem. GrantCatalogItem (and
+    GetCatalogItem, AddUserItem, AddInventoryItems, ExecuteInventoryApi) all
+    answer with a bare HTTP 404 and an empty body on this title, which means the
+    method does not exist here. GrantItemsToUser is the legacy Entity API and
+    works. It takes a LIST under "ItemIds", not "ItemId".
+
+    Note it returns 200 even when the item does not exist, with Result:false in
+    ItemGrantResults. That has to be treated as a failure, otherwise the code
+    gets burned for a cosmetic that was never granted.
+    """
     if not playfab_id or not item_id:
         return False, {"errorMessage": "playfab_id and item_id required"}
     # Resolve to the catalog's own spelling so a dot-less id still resolves.
     resolved = resolve_catalog_item_id(item_id)
     if not resolved:
         return False, {"errorMessage": "no catalog item matches {0}".format(item_id)}
-    return pf_request("GrantCatalogItem", {
+
+    ok, result = pf_request("GrantItemsToUser", {
         "PlayFabId": playfab_id,
-        "ItemId": resolved,
+        "ItemIds": [resolved],
         "Labels": ["redeem"],
     })
+    if not ok:
+        return False, result
+
+    results = (result.get("data") or {}).get("ItemGrantResults") or []
+    if not results:
+        return False, {"errorMessage": "PlayFab returned no grant result"}
+    first = results[0] or {}
+    if not first.get("Result"):
+        return False, {"errorMessage": "PlayFab declined the grant for {0}".format(resolved)}
+    return True, {"ItemInstanceId": first.get("ItemInstanceId"),
+                  "ItemId": resolved,
+                  "PurchaseDate": first.get("PurchaseDate")}
 
 
 def grant_currency(playfab_id, currency_code, amount):
@@ -1167,6 +1198,56 @@ def grant_reward(playfab_id, entry):
         return grant_currency(playfab_id, entry.get("reward_id"),
                               entry.get("amount"))
     return grant_cosmetic(playfab_id, entry.get("reward_id"))
+
+
+# --- redeem log -----------------------------------------------------------
+
+def load_redeem_log():
+    """Rolling window of recent redemptions. Never raises."""
+    ok, result = pf_request("GetTitleData", {})
+    if not ok:
+        return []
+    value = ((result.get("data") or {}).get("Data") or {}).get(REDEEM_LOG_KEY)
+    if not value:
+        return []
+    try:
+        value = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def append_redeem_log(code, entry, playfab_id, granted, detail=None):
+    """Append one redemption. Newest first, capped, and never fatal.
+
+    A full or unwritable log must not fail the redemption - the grant already
+    happened by the time this is called.
+    """
+    rows = load_redeem_log()
+    rows.insert(0, {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "code": code[:64],
+        "playfab_id": (playfab_id or "")[:64],
+        "reward_type": (entry.get("reward_type") or "")[:32],
+        "reward_id": (entry.get("reward_id") or "")[:64],
+        "amount": entry.get("amount", 0),
+        "granted": bool(granted),
+        "detail": (detail or "")[:160],
+    })
+    rows = rows[:max(1, REDEEM_LOG_MAX_ENTRIES)]
+
+    encoded = json.dumps(rows)
+    if len(encoded.encode("utf-8")) > REDEEM_LOG_MAX_BYTES:
+        # Drop from the back until it fits rather than writing an over-size
+        # value that PlayFab would truncate into unparseable JSON.
+        while rows and len(json.dumps(rows).encode("utf-8")) > REDEEM_LOG_MAX_BYTES:
+            rows.pop()
+        encoded = json.dumps(rows)
+
+    ok, result = pf_request("SetTitleData", {"Key": REDEEM_LOG_KEY, "Value": encoded})
+    if not ok:
+        print("[redeem] could not write the redeem log: {0}".format(result))
+    return ok
 
 
 # --- discord --------------------------------------------------------------
@@ -1264,12 +1345,16 @@ def redeem():
         detail = (grant_error or {}).get("errorMessage") or "grant failed"
         print("[redeem] grant failed for {0} -> {1}: {2}".format(
             code, playfab_id, detail))
+        append_redeem_log(code, entry, playfab_id, False, detail)
         return _redeem_reject(
             "COULD NOT GRANT THE REWARD. TRY AGAIN LATER.", 502, detail)
 
     # Record the spend only after the grant succeeded, so a failed grant stays
     # retryable.
     mark_player_redeemed(playfab_id, code, already_used)
+    append_redeem_log(code, entry, playfab_id, True, "granted")
+    print("[redeem] granted {0} -> {1} ({2})".format(
+        code, playfab_id, entry.get("reward_id") or entry.get("amount")))
 
     webhook_sent, webhook_error = post_webhook(
         REDEEM_WEBHOOK_URL,
@@ -1286,6 +1371,20 @@ def redeem():
         "platform": platform,
         "webhook_sent": webhook_sent,
         "webhook_error": webhook_error,
+    })
+
+
+@app.route("/api/redeem-log", methods=["GET"])
+def redeem_log():
+    """Recent redemptions, newest first. Secret required - it holds player ids."""
+    if not check_secret_request():
+        return jsonify({"success": False, "error": "bad secret"}), 401
+    rows = load_redeem_log()
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "max_entries": REDEEM_LOG_MAX_ENTRIES,
+        "entries": rows,
     })
 
 

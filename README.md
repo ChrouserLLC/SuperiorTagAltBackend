@@ -8,8 +8,8 @@ merged PlayFab CloudScript and the Unity client scripts that talk to them.
 | **Player tracker** | Lobby join/leave, player join/leave, online counts -> Discord | `POST /api/tracker`, `POST /api/online-count` |
 | **Custom reports** | In-game report -> moderation channel | `POST /api/report` |
 | **Insta-ban** | A report can trigger a PlayFab ban via CloudScript | runs inside `/api/report` |
-| **Redeem codes** | In-game REDEEM tab -> PlayFab catalog item | `POST /api/redeem`, `GET/POST /api/redeem-codes` |
-| **Dashboard** | Browser view of who is online and who is staff | `GET /dashboard`, `GET /api/dashboard` |
+| **Redeem codes** | In-game REDEEM tab -> PlayFab catalog item | `POST /api/redeem`, `GET/POST /api/redeem-codes`, `GET /api/redeem-log` |
+| **Dashboard** | Browser view of who is online, who is staff, and your codes | `GET /dashboard`, `GET /api/dashboard` |
 
 Originally three separate Vercel projects (`Custom Reports`, `Custom Player
 Tracker`, `Custom InstaBan`) each with their own `index.py`, `vercel.json` and
@@ -26,7 +26,7 @@ cloudscript/SuperiorTagAlt.js   merged PlayFab CloudScript
 Unity/ReportSender.cs     reports + insta-ban kick (Unity side)
 Unity/PlayerTracker.cs    player tracker (Unity side)
 seed_dev.py               local-only fake data, for looking at the dashboard
-test_index.py             134 smoke tests, no credentials needed
+test_index.py             257 smoke tests, no credentials needed
 .env.example              every env var, placeholders only
 vercel.json               Vercel build config
 ```
@@ -41,8 +41,20 @@ Open `https://<your-domain>/dashboard`. Paste `API_SECRET`, and it shows:
 - the online players with their role badge (Owner / Admin / Moderator / CC)
 - the tracked-role counts
 - whether PlayFab is configured, and where the count came from
+- **redeem codes** — create, edit, enable/disable and delete them here
+- **recent redemptions** — the last `REDEEM_LOG_MAX_ENTRIES` (default 25), newest first
 
 It polls every 15s and stores the secret in `localStorage`.
+
+### Managing codes from the dashboard
+
+This is the place to put your codes; you do not need curl.
+
+Cosmetic rewards still need a catalog tag first — open the item in
+PlayFab (Catalogs (Legacy) → DLC → Items), add the tag `redeem:CODE`, then create
+the same code below to set its label, max uses and enabled state. The panel tells
+you this too, and flags any tagged item it cannot grant. Currency codes need no
+catalog item and can be made entirely from the panel.
 
 **Known limitation, stated plainly:** the online list lives in server memory, so
 it resets whenever the host recycles the container (normal on Vercel). Entries

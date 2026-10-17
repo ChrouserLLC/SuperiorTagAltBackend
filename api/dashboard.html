@@ -173,6 +173,49 @@
   .banner { padding: 12px 16px; font-size: 13.5px; border-bottom: 1px solid var(--border); }
   .banner.warn { background: rgba(210,153,34,.10); color: #e3b341; }
 
+  /* ---- redeem panel ---- */
+  .panel .body { padding: 16px; border-bottom: 1px solid var(--border); }
+  .panel .body:last-child { border-bottom: 0; }
+
+  .grid2 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+  }
+  .grid2 .full { grid-column: 1 / -1; }
+
+  select {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 13px;
+  }
+  select:focus { outline: none; border-color: var(--accent); }
+
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  .actions .msg { font-size: 13px; }
+  .actions .msg.ok  { color: var(--ok); }
+  .actions .msg.bad { color: #ff9d96; }
+
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 650; letter-spacing: .3px;
+  }
+  .badge.cosmetic { background: rgba(47,129,247,.16);  color: #79b8ff; }
+  .badge.currency { background: rgba(63,185,80,.16);   color: var(--ok); }
+  .badge.tag      { background: rgba(163,113,247,.16); color: var(--owner); }
+  .badge.settings { background: rgba(139,148,158,.14); color: var(--muted); }
+  .badge.off      { background: rgba(248,81,73,.16);    color: #ff9d96; }
+
+  .yes { color: var(--ok); }
+  .no  { color: #ff9d96; }
+  .tiny { font-size: 12.5px; color: var(--muted); }
+  .code { font-weight: 650; }
+
   footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
 </style>
 </head>
@@ -246,6 +289,85 @@
     <div class="panel">
       <h3>Tracked roles</h3>
       <div id="roleTable"></div>
+    </div>
+
+    <!-- ================= REDEEM CODES ================= -->
+    <div class="panel">
+      <h3>Redeem codes <span class="count" id="codeCount"></span></h3>
+
+      <div class="body">
+        <div class="tiny" style="margin-bottom:14px;">
+          <strong>Cosmetics come from the catalog, not from here.</strong>
+          To make a cosmetic redeemable, open that item in the PlayFab catalog and
+          tag it <span class="mono" id="tagPrefix">redeem:</span><span class="mono">CODE</span>
+          — then create the code below with the same word to set its label, max uses and
+          enabled state. A cosmetic created here with no tagged item will be rejected.
+          <br>
+          <strong>Currency codes</strong> need no catalog item, so create those entirely here.
+        </div>
+
+        <div class="grid2">
+          <div>
+            <label for="fCode">Code</label>
+            <input id="fCode" placeholder="SUMMER" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="fType">Reward type</label>
+            <select id="fType">
+              <option value="cosmetic">Cosmetic (from catalog tag)</option>
+              <option value="currency">Virtual currency</option>
+            </select>
+          </div>
+
+          <div id="fCurWrap" class="hidden">
+            <label for="fCurrency">Currency code</label>
+            <input id="fCurrency" placeholder="SR" autocomplete="off" spellcheck="false">
+          </div>
+
+          <div id="fAmtWrap" class="hidden">
+            <label for="fAmount">Amount</label>
+            <input id="fAmount" type="number" min="1" step="1" value="1">
+          </div>
+
+          <div>
+            <label for="fLabel">Reward label <span class="tiny">(shown in game)</span></label>
+            <input id="fLabel" placeholder="SUMMER SCARF" autocomplete="off" spellcheck="false">
+          </div>
+
+          <div>
+            <label for="fMax">Max uses <span class="tiny">(per player, 0 = once)</span></label>
+            <input id="fMax" type="number" min="0" step="1" value="0">
+          </div>
+
+          <div>
+            <label for="fEnabled">Enabled</label>
+            <select id="fEnabled">
+              <option value="true">Yes</option>
+              <option value="false">No</option>
+            </select>
+          </div>
+
+          <div class="full">
+            <label for="fNote">Note <span class="tiny">(private, for you)</span></label>
+            <input id="fNote" placeholder="summer event 2026" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="fSave">Save code</button>
+          <button class="ghost" id="fClear">Clear form</button>
+          <span class="msg" id="fMsg"></span>
+        </div>
+      </div>
+
+      <div id="codeProblems"></div>
+      <div id="codeTable"></div>
+    </div>
+
+    <!-- ================= REDEEM LOG ================= -->
+    <div class="panel">
+      <h3>Recent redemptions <span class="count" id="logCount"></span></h3>
+      <div id="logTable"></div>
     </div>
 
     <footer>
@@ -378,6 +500,198 @@
       + "</tbody></table>";
   }
 
+  // ---- redeem codes ---------------------------------------------------------
+
+  function apiGet(path) {
+    return fetch(path, {
+      headers: { "X-Api-Secret": secret },
+      cache: "no-store"
+    }).then(function (r) {
+      if (r.status === 401) { var e = new Error("Bad secret."); e.unauthorized = true; throw e; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function apiPost(path, body) {
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Api-Secret": secret },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (r.status === 401) { var e = new Error("Bad secret."); e.unauthorized = true; throw e; }
+      return r.json().then(function (j) {
+        if (!r.ok || j.success === false) throw new Error(j.error || "HTTP " + r.status);
+        return j;
+      });
+    });
+  }
+
+  function formMsg(text, kind) {
+    var el = $("fMsg");
+    el.textContent = text;
+    el.className = "msg" + (kind ? " " + kind : "");
+    if (text) setTimeout(function () { if (el.textContent === text) el.textContent = ""; }, 6000);
+  }
+
+  function clearForm() {
+    ["fCode", "fLabel", "fNote", "fCurrency"].forEach(function (id) { $(id).value = ""; });
+    $("fAmount").value = "1";
+    $("fMax").value = "0";
+    $("fEnabled").value = "true";
+    $("fType").value = "cosmetic";
+    syncRewardFields();
+    formMsg("");
+  }
+
+  function syncRewardFields() {
+    var isCur = $("fType").value === "currency";
+    $("fCurWrap").classList.toggle("hidden", !isCur);
+    $("fAmtWrap").classList.toggle("hidden", !isCur);
+  }
+
+  function renderCodes(d) {
+    var codes = d.codes || [];
+    $("tagPrefix").textContent = d.tag_prefix || "redeem:";
+    $("codeCount").textContent = codes.length ? "(" + codes.length + ")" : "";
+
+    var problems = d.problems || [];
+    $("codeProblems").innerHTML = problems.length
+      ? '<div class="banner warn" style="border-bottom:1px solid var(--border);">'
+        + esc(problems.length) + " catalog item(s) carry a redeem tag but cannot be granted: "
+        + esc(problems.join(", ")) + "</div>"
+      : "";
+
+    if (!codes.length) {
+      $("codeTable").innerHTML =
+        '<div class="empty">No codes yet. Cosmetics need a catalog tag first.</div>';
+      return;
+    }
+
+    var rows = codes.map(function (c) {
+      var src = c.source === "catalog_tag" ? "tag" : "settings";
+      return "<tr>"
+        + '<td><span class="code">' + esc(c.code) + "</span></td>"
+        + '<td><span class="badge ' + esc(c.reward_type || "cosmetic") + '">'
+        + esc(c.reward_type || "cosmetic") + "</span></td>"
+        + "<td>" + esc(c.reward_label || c.reward_id || "—")
+          + (c.reward_id && c.reward_label
+              ? ' <span class="mono">' + esc(c.reward_id) + "</span>" : "")
+        + "</td>"
+        + '<td><span class="badge ' + src + '">' + src + "</span></td>"
+        + "<td>" + (c.enabled ? '<span class="yes">yes</span>' : '<span class="no">no</span>') + "</td>"
+        + "<td>" + esc(c.max_uses || 0) + "</td>"
+        + '<td class="tiny">' + esc(c.note || "") + "</td>"
+        + '<td><button class="ghost" data-edit="' + esc(c.code) + '">Edit</button> '
+        + '<button class="ghost" data-del="' + esc(c.code) + '">Delete</button></td>'
+        + "</tr>";
+    }).join("");
+
+    $("codeTable").innerHTML =
+      "<table><thead><tr><th>Code</th><th>Type</th><th>Reward</th><th>Source</th>"
+      + "<th>Enabled</th><th>Max uses</th><th>Note</th><th></th></tr></thead><tbody>"
+      + rows + "</tbody></table>";
+  }
+
+  function renderLog(d) {
+    var rows = d.entries || [];
+    $("logCount").textContent = rows.length
+      ? "(" + rows.length + " of " + d.max_entries + " kept)" : "";
+
+    if (!rows.length) {
+      $("logTable").innerHTML = '<div class="empty">No redemptions recorded yet.</div>';
+      return;
+    }
+
+    var html = rows.map(function (r) {
+      var what = r.reward_type === "currency"
+        ? esc(r.reward_id) + " &times;" + esc(r.amount)
+        : esc(r.reward_label || r.reward_id);
+      return "<tr>"
+        + '<td class="tiny">' + esc(r.at) + "</td>"
+        + "<td><span class=\"code\">" + esc(r.code) + "</span></td>"
+        + '<td class="mono">' + esc(r.playfab_id || "—") + "</td>"
+        + "<td>" + what + "</td>"
+        + '<td>' + (r.granted
+            ? '<span class="badge currency">granted</span>'
+            : '<span class="badge off">failed</span>') + "</td>"
+        + '<td class="tiny">' + esc(r.detail || "") + "</td>"
+        + "</tr>";
+    }).join("");
+
+    $("logTable").innerHTML =
+      "<table><thead><tr><th>When (UTC)</th><th>Code</th><th>Player</th>"
+      + "<th>Reward</th><th>Result</th><th>Detail</th></tr></thead><tbody>"
+      + html + "</tbody></table>";
+  }
+
+  function loadRedeem() {
+    apiGet("/api/redeem-codes")
+      .then(renderCodes)
+      .catch(function (e) { $("codeTable").innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+    apiGet("/api/redeem-log")
+      .then(renderLog)
+      .catch(function (e) { $("logTable").innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+  }
+
+  function saveCode() {
+    var code = $("fCode").value.trim().toUpperCase();
+    if (!code) { formMsg("Enter a code first.", "bad"); return; }
+
+    var isCur = $("fType").value === "currency";
+    var body = {
+      code: code,
+      enabled: $("fEnabled").value === "true",
+      max_uses: parseInt($("fMax").value, 10) || 0,
+      reward_label: $("fLabel").value.trim(),
+      note: $("fNote").value.trim()
+    };
+    if (isCur) {
+      var cur = $("fCurrency").value.trim().toUpperCase();
+      var amt = parseInt($("fAmount").value, 10);
+      if (!cur) { formMsg("Currency codes need a currency code (SR or RM).", "bad"); return; }
+      if (!(amt > 0)) { formMsg("Amount must be at least 1.", "bad"); return; }
+      body.reward_type = "currency";
+      body.reward_id = cur;
+      body.amount = amt;
+    }
+
+    formMsg("Saving…");
+    apiPost("/api/redeem-codes", body).then(function () {
+      formMsg("Saved " + code + ".", "ok");
+      loadRedeem();
+    }).catch(function (e) { formMsg(e.message, "bad"); });
+  }
+
+  function editCode(code) {
+    apiGet("/api/redeem-codes").then(function (d) {
+      var c = (d.codes || []).filter(function (x) { return x.code === code; })[0];
+      if (!c) { formMsg("Could not read " + code + ".", "bad"); return; }
+      $("fCode").value = c.code;
+      $("fType").value = c.reward_type || "cosmetic";
+      $("fCurrency").value = c.reward_type === "currency" ? (c.reward_id || "") : "";
+      $("fAmount").value = c.amount || 1;
+      $("fLabel").value = c.reward_label || "";
+      $("fMax").value = c.max_uses || 0;
+      $("fEnabled").value = c.enabled ? "true" : "false";
+      $("fNote").value = c.note || "";
+      syncRewardFields();
+      formMsg("Editing " + c.code + ". Save to apply.");
+      window.scrollTo(0, document.body.scrollHeight * 0.4);
+    }).catch(function (e) { formMsg(e.message, "bad"); });
+  }
+
+  function deleteCode(code) {
+    if (!window.confirm("Delete settings for " + code + "?\n\n"
+      + "Cosmetic items stay tagged in the PlayFab catalog, so the code will\n"
+      + "still exist until you remove the tag there.")) return;
+    formMsg("Deleting…");
+    apiPost("/api/redeem-codes", { code: code, delete: true }).then(function () {
+      formMsg("Deleted " + code + ".", "ok");
+      loadRedeem();
+    }).catch(function (e) { formMsg(e.message, "bad"); });
+  }
+
   // ---- flow ----------------------------------------------------------------
 
   function stopPolling() {
@@ -388,7 +702,10 @@
     $("login").classList.add("hidden");
     $("app").classList.remove("hidden");
     render(d);
+    loadRedeem();
     stopPolling();
+    // Codes and the log are refreshed on the same tick as the dashboard so a
+    // redemption shows up without a manual refresh.
     timer = setInterval(function () { refresh(true); }, POLL_MS);
   }
 
@@ -405,6 +722,7 @@
   function refresh(quiet) {
     fetchData().then(function (d) {
       render(d);
+      loadRedeem();
       setLive(true, "live");
     }).catch(function (e) {
       if (e.unauthorized) { clear(); secret = ""; showLogin("Wrong secret. Try again."); return; }
@@ -444,6 +762,24 @@
   $("lock").addEventListener("click", function () {
     clear(); secret = ""; showLogin("");
   });
+
+  // ---- redeem events -------------------------------------------------------
+
+  $("fSave").addEventListener("click", saveCode);
+  $("fClear").addEventListener("click", clearForm);
+  $("fType").addEventListener("change", syncRewardFields);
+
+  $("fCode").addEventListener("keydown", function (e) { if (e.key === "Enter") saveCode(); });
+
+  // Delegated so the buttons do not have to be re-bound every 15s poll.
+  $("codeTable").addEventListener("click", function (e) {
+    var t = e.target;
+    if (!t || !t.getAttribute) return;
+    if (t.getAttribute("data-edit")) { editCode(t.getAttribute("data-edit")); return; }
+    if (t.getAttribute("data-del"))  { deleteCode(t.getAttribute("data-del")); }
+  });
+
+  syncRewardFields();
 
   // ---- boot ----------------------------------------------------------------
 

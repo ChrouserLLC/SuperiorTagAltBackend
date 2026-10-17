@@ -540,20 +540,33 @@ CATALOG = [
 
 
 class _FakePlayFab(object):
-    def __init__(self, settings=None, catalog=None, grant_ok=True):
+    def __init__(self, settings=None, catalog=None, grant_ok=True,
+                 grant_result_true=True):
         self.settings = dict(settings or {})
         self.catalog = list(catalog if catalog is not None else CATALOG)
+        # grant_ok=False simulates the call itself failing (HTTP error).
+        # grant_result_true=False simulates the 200-with-Result:false case that
+        # GrantItemsToUser returns for an item it will not actually give.
         self.grant_ok = grant_ok
+        self.grant_result_true = grant_result_true
         self.user_data = {}
         self.grants = []
         self.currency_grants = []
+        self.title_data = {"RedeemCodes": json.dumps(self.settings)}
+        self.log_rows = []
+
+    def _sync_title(self):
+        self.title_data["RedeemCodes"] = json.dumps(self.settings)
 
     def __call__(self, path, body):
         if path == "GetTitleData":
-            return True, {"data": {"Data": {
-                "RedeemCodes": json.dumps(self.settings)}}}
+            return True, {"data": {"Data": dict(self.title_data)}}
         if path == "SetTitleData":
-            self.settings = json.loads(body["Value"])
+            if body["Key"] == "RedeemCodes":
+                self.settings = json.loads(body["Value"])
+                self._sync_title()
+            else:
+                self.title_data[body["Key"]] = body["Value"]
             return True, {}
         if path == "GetCatalogItems":
             return True, {"data": {"Catalog": self.catalog}}
@@ -563,11 +576,17 @@ class _FakePlayFab(object):
         if path == "UpdateUserData":
             self.user_data[body["PlayFabId"]] = body["Data"]["RedeemUsed"]
             return True, {}
-        if path == "GrantCatalogItem":
+        if path == "GrantItemsToUser":
             if not self.grant_ok:
                 return False, {"errorMessage": "Entity not found"}
-            self.grants.append((body["PlayFabId"], body["ItemId"]))
-            return True, {}
+            item_id = body["ItemIds"][0]
+            self.grants.append((body["PlayFabId"], item_id))
+            return True, {"data": {"ItemGrantResults": [{
+                "PlayFabId": body["PlayFabId"],
+                "ItemId": item_id,
+                "Result": self.grant_result_true,
+                "ItemInstanceId": "INSTANCE1" if self.grant_result_true else None,
+            }]}}
         if path == "AddUserVirtualCurrency":
             if not self.grant_ok:
                 return False, {"errorMessage": "Entity not found"}
@@ -582,13 +601,13 @@ _real_webhook = mod.REDEEM_WEBHOOK_URL
 mod.REDEEM_WEBHOOK_URL = ""
 
 
-def use_fake(settings=None, catalog=None, grant_ok=True):
+def use_fake(settings=None, catalog=None, grant_ok=True, grant_result_true=True):
     """Swap in a fake PlayFab and drop every cache.
 
     The catalog/settings caches are deliberate (they stop every redeem hitting
     PlayFab), so a test that changes either has to invalidate it too.
     """
-    fake = _FakePlayFab(settings, catalog, grant_ok)
+    fake = _FakePlayFab(settings, catalog, grant_ok, grant_result_true)
     mod.pf_request = fake
     drop_cache()
     return fake
@@ -833,6 +852,63 @@ r = app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "PFC"}))
 check("a repeat within the cooldown is refused", r.status_code == 429, r.status_code)
 check("the cooldown tells the player how long to wait",
       "SECONDS" in (r.get_json().get("message") or ""), r.get_json())
+
+# --- GrantItemsToUser contract -------------------------------------------
+# GrantItemsToUser answers 200 even when it refuses to grant, with Result:false.
+# Treating that as success would burn the code for a cosmetic never given.
+silent = use_fake(grant_result_true=False)
+r = redeem({"code": "BETA", "playfab_id": "PFQ"})
+check("a 200-with-Result:false is treated as a failure", r.status_code == 502, r.status_code)
+check("the refusal explains itself", "declined" in (r.get_json().get("error") or ""), r.get_json())
+check("a declined grant does not burn the code", "PFQ" not in silent.user_data, silent.user_data)
+
+use_fake()
+ok, res = mod.grant_cosmetic("PF1", "LBAAC")
+check("grant_cosmetic succeeds when Result is true", ok, res)
+check("grant_cosmetic returns the new instance id",
+      (res or {}).get("ItemInstanceId") == "INSTANCE1", res)
+
+ok, res = mod.grant_cosmetic("PF1", "NOPE_NOT_REAL")
+check("grant_cosmetic rejects an id that is not in the catalog", ok is False, res)
+check("the rejection names the id", "NOPE_NOT_REAL" in (res or {}).get("errorMessage", ""), res)
+
+# --- redeem log -----------------------------------------------------------
+logged = use_fake()
+redeem({"code": "BETA", "playfab_id": "PFA"})
+redeem({"code": "BETA", "playfab_id": "PFB"})
+rows = mod.load_redeem_log()
+check("a successful redeem is logged", len(rows) >= 2, rows)
+check("the log records the code", rows[0].get("code") == "BETA", rows[0])
+check("the log records the player", rows[0].get("playfab_id") == "PFB", rows[0])
+check("the log records what was granted", rows[0].get("reward_id") == "LBAAC.", rows[0])
+check("the log records success", rows[0].get("granted") is True, rows[0])
+check("the log is newest first", rows[0].get("playfab_id") == "PFB"
+      and rows[1].get("playfab_id") == "PFA", [r.get("playfab_id") for r in rows])
+check("the log has a timestamp", bool(rows[0].get("at")), rows[0])
+
+r = app.get("/api/redeem-log")
+check("the redeem log rejects a missing secret", r.status_code == 401)
+r = app.get("/api/redeem-log", headers={"X-Api-Secret": SECRET})
+check("the redeem log is readable", r.get_json().get("success") is True, r.get_json())
+check("the log endpoint reports the entry count",
+      r.get_json().get("count", 0) >= 2, r.get_json())
+
+# a failed grant is logged too, so a broken code is visible without Vercel logs
+use_fake(grant_result_true=False)
+redeem({"code": "BETA", "playfab_id": "PFX"})
+rows = mod.load_redeem_log()
+check("a failed grant is logged", rows and rows[0].get("granted") is False, rows[:1])
+check("a failed grant logs the reason",
+      "declined" in (rows[0].get("detail") or ""), rows[0])
+
+# the log is capped so TitleData cannot overflow
+mod.REDEEM_LOG_MAX_ENTRIES = 3
+use_fake()
+for i in range(6):
+    redeem({"code": "BETA", "playfab_id": "PF{}".format(i)})
+check("the log honours its entry cap", len(mod.load_redeem_log()) == 3,
+      len(mod.load_redeem_log()))
+mod.REDEEM_LOG_MAX_ENTRIES = 25
 
 # --- limits ---------------------------------------------------------------
 mod.REDEEM_CODES_MAX_BYTES = 10
