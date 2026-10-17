@@ -65,8 +65,11 @@ check("playfab_configured false (no creds)", d.get("playfab_configured") is Fals
 
 r = app.get("/")
 d = r.get_json()
-check("root lists 4 features", sorted(d.get("features") or []) == ["dashboard", "instaban", "reports", "tracker"], d)
+check("root lists 5 features", sorted(d.get("features") or []) ==
+      ["dashboard", "instaban", "redeem", "reports", "tracker"], d)
 check("root lists /api/report", "/api/report" in (d.get("endpoints") or []), d)
+check("root lists /api/redeem", "/api/redeem" in (d.get("endpoints") or []), d)
+check("root lists /api/redeem-codes", "/api/redeem-codes" in (d.get("endpoints") or []), d)
 check("root points at /dashboard", d.get("dashboard") == "/dashboard", d)
 
 # ---------------------------------------------------------------------------

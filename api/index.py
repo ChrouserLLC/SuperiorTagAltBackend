@@ -1540,6 +1540,12 @@ def health():
         "tracker_webhook_set": bool(TRACKER_WEBHOOK_URL),
         "vip_webhook_set": bool(TRACKER_VIP_WEBHOOK_URL),
         "report_webhook_set": bool(REPORT_WEBHOOK_URL),
+        "redeem_webhook_set": bool(REDEEM_WEBHOOK_URL),
+        # 'catalogue' is the name here because 'catalog' would read as a bug to
+        # anyone who has just spent time in the PlayFab dashboard.
+        "redeem_catalogue_items": len(load_catalog()),
+        "redeem_codes_from_tags": len(load_redeem_index(force=True)[0]),
+        "redeem_settings_codes": len(load_settings()),
     })
 
 
@@ -1547,9 +1553,11 @@ def health():
 def home():
     return jsonify({
         "service": "SuperiorTagAlt",
-        "features": ["tracker", "reports", "instaban", "dashboard"],
+        "features": ["tracker", "reports", "instaban", "redeem", "dashboard"],
         "endpoints": [
-            "/api/report", "/api/tracker", "/api/online-count",
+            "/api/report", "/api/tracker", "/api/redeem",
+            "/api/redeem-codes",
+            "/api/online-count",
             "/api/online", "/api/dashboard", "/api/tracker/tracked",
             "/api/tracker/refresh", "/api/health",
         ],
