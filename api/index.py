@@ -57,17 +57,17 @@ TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 # global count from /api/online-count; this list is best-effort detail.
 ONLINE_PLAYER_TTL_SECONDS = int(os.environ.get("ONLINE_PLAYER_TTL_SECONDS", "900"))
 
-# Redeem codes live in TitleData so they can be added or changed without a
-# redeploy. The seed table below is only used until TitleData has a value.
+# Redeem: which cosmetics are redeemable comes from catalog TAGS
+# (redeem:CODE), not from here. The table below only holds per-code settings
+# and currency rewards, so a code can be turned off or annotated without
+# touching PlayFab. See REDEEM_TAG_PREFIX near the redeem section.
 REDEEM_CODES_KEY = os.environ.get("REDEEM_CODES_KEY", "RedeemCodes")
 # Which codes a player has already spent. Stored in the player's own private
 # UserData rather than TitleData: one shared TitleData value would grow forever
 # and eventually hit the TitleData size cap, silently losing redemption history.
 REDEEM_USED_KEY = os.environ.get("REDEEM_USED_KEY", "RedeemUsed")
 REDEEM_COOLDOWN_SECONDS = int(os.environ.get("REDEEM_COOLDOWN_SECONDS", "5"))
-REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "")
-REDEEM_CODES_SEED = os.environ.get("REDEEM_CODES_JSON", "")
-REDEEM_CODES_CACHE_TTL_SECONDS = 30
+REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "https://discord.com/api/webhooks/1560930877775679499/MWskoFRx4B6NPGvOC-kEw1pyZCtV6V-kP8lU5sMBxNOkRs6SrH88Cib9Ral1rLwsPPXF")
 
 try:
     ROLE_EMOJIS = json.loads(os.environ.get("TRACKER_ROLE_EMOJIS", "{}"))
@@ -177,6 +177,11 @@ _online_global_count = 0
 _online_global_at = 0.0
 _redeem_codes_cache = None
 _redeem_codes_cache_at = 0.0
+_catalog_cache = None
+_catalog_cache_at = 0.0
+_redeem_index_cache = None
+_redeem_index_cache_at = 0.0
+_redeem_index_problems = []
 
 
 # ---------------------------------------------------------------------------
@@ -799,34 +804,152 @@ def tracker():
 # Redeem codes
 # ---------------------------------------------------------------------------
 #
-# The code table is a JSON object keyed by the upper-cased code:
+# A code points at a reward two ways:
+#
+#   1. Cosmetics  - tag the catalog item with "redeem:CODE" in the PlayFab
+#                   dashboard. The backend scans the catalog for that tag, so you
+#                   never copy an Item ID anywhere.
+#   2. Currency   - PlayFab virtual currency (this title uses SR and RM). These
+#                   have no catalog item to tag, so they are declared in the
+#                   settings table below.
+#
+# The settings table (PlayFab TitleData, key RedeemCodes) holds only *how* a code
+# behaves - enabled, max_uses, note - never *what* it gives for a cosmetic. That
+# keeps the catalog the single source of truth for cosmetics:
 #
 #   {
-#     "BETA": {
-#       "reward_type":  "cosmetic",     # cosmetic | credits
-#       "reward_id":    "LBAAA",        # PlayFab catalog ItemId
-#       "reward_label": "BETA TESTER",  # shown to the player
-#       "credits":      0,              # display only when reward_type is credits
-#       "max_uses":     0,              # 0 = unlimited per player
-#       "enabled":      true,
-#       "note":         ""              # never shown to players, for you
-#     }
+#     "BETA":   {"enabled": true, "max_uses": 0, "note": "announcement"},
+#     "GOLD":   {"reward_type": "currency", "reward_id": "SR",
+#                "amount": 5000, "reward_label": "5000 SHINY ROCKS",
+#                "enabled": true, "note": ""}
 #   }
 #
-# There is no separate currency in GorillaNetworking - cosmetics are PlayFab
-# catalog items, so "credits" is also just a catalog ItemId and grant_cosmetic()
-# stays the single write path. reward_id is the thing that actually matters;
-# credits/label are only what the player is shown.
+# Why Tags and not Custom Data: the legacy DLC catalog does not expose Custom
+# Data through any PlayFab API the server can reach. Server/GetCatalogItems
+# omits the field entirely, Server/GetCatalogItem 404s, and the catalog is not
+# in TitleData. Tags ARE returned, so they are the only marker that works.
 
-REDEEM_REWARD_TYPES = ("cosmetic", "credits")
+REDEEM_REWARD_TYPES = ("cosmetic", "currency")
+
+# Custom tag prefix an item must carry to be redeemable, e.g. "redeem:BETA".
+REDEEM_TAG_PREFIX = "redeem:"
 
 # PlayFab caps a TitleData value at 4000 bytes. Refuse to save past that rather
 # than letting PlayFab silently truncate the table into unparseable JSON.
 REDEEM_CODES_MAX_BYTES = 3800
 
+REDEEM_CATALOG_CACHE_TTL_SECONDS = 60
+REDEEM_CODES_CACHE_TTL_SECONDS = 30
 
-def _normalise_code_table(raw):
-    """Coerce whatever is in TitleData into {CODE: entry} with sane defaults."""
+
+# --- item id helpers ------------------------------------------------------
+
+def _strip_trailing_dot(item_id):
+    """PlayFab's legacy DLC catalog stores cosmetic ids with a trailing dot
+    ("LBAAC.") while the game uses them without ("LBAAC"). Normalise so a code
+    works whichever spelling you type. Only ONE dot is stripped, because "..."
+    is itself a real ItemId in this catalog.
+    """
+    if item_id.endswith("."):
+        return item_id[:-1]
+    return item_id
+
+
+# --- catalog --------------------------------------------------------------
+
+def load_catalog(force=False):
+    """Fetch the DLC catalog. Never raises; returns [] on failure.
+
+    ~1300 items / ~400KB and ~0.4s to fetch, so it is cached. A failed fetch
+    returns the previous cache rather than wiping the code index, because
+    "no codes available" for a minute is worse than briefly-stale codes.
+    """
+    global _catalog_cache, _catalog_cache_at
+    now = time.time()
+    if (not force and _catalog_cache is not None
+            and now - _catalog_cache_at <= REDEEM_CATALOG_CACHE_TTL_SECONDS):
+        return _catalog_cache
+
+    ok, result = pf_request("GetCatalogItems", {
+        "CatalogVersion": "DLC",
+        "Etag": "",
+    })
+    if not ok:
+        return _catalog_cache or []
+    catalog = ((result.get("data") or {}).get("Catalog")) or []
+    _catalog_cache = catalog
+    _catalog_cache_at = now
+    return catalog
+
+
+def load_redeem_index(force=False):
+    """{CODE: reward} built from catalog items tagged redeem:CODE.
+
+    Returns (index, problems) so the caller can surface duplicate tags instead
+    of silently picking one item.
+    """
+    global _redeem_index_cache, _redeem_index_cache_at, _redeem_index_problems
+    now = time.time()
+    if (not force and _redeem_index_cache is not None
+            and now - _redeem_index_cache_at <= REDEEM_CODES_CACHE_TTL_SECONDS):
+        return _redeem_index_cache, _redeem_index_problems
+
+    index = {}
+    problems = []
+    for item in load_catalog():
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("ItemId") or ""
+        if not item_id:
+            continue
+        for tag in item.get("Tags") or []:
+            if not isinstance(tag, str):
+                continue
+            tag = tag.strip()
+            if not tag.lower().startswith(REDEEM_TAG_PREFIX):
+                continue
+            code = tag[len(REDEEM_TAG_PREFIX):].strip().upper()
+            if not code:
+                problems.append("item {0} has a bare 'redeem:' tag".format(item_id))
+                continue
+            if code in index:
+                problems.append(
+                    "code {0} is claimed by both {1} and {2}".format(
+                        code, index[code]["reward_id"], item_id))
+                continue
+            index[code] = {
+                "reward_type": "cosmetic",
+                "reward_id": item_id,
+                # DisplayName is empty on every legacy DLC item, so fall back to
+                # the id. Set reward_label in the settings table for a nicer one.
+                "reward_label": (item.get("DisplayName") or "").strip() or item_id,
+                "amount": 0,
+                "source": "catalog_tag",
+            }
+
+    _redeem_index_cache = index
+    _redeem_index_problems = problems
+    _redeem_index_cache_at = now
+    return index, problems
+
+
+def resolve_catalog_item_id(item_id):
+    """Map a possibly-dot-less ItemId onto the catalog's real spelling."""
+    if not item_id:
+        return None
+    wanted = _strip_trailing_dot(item_id.strip())
+    for item in load_catalog():
+        candidate = item.get("ItemId") or ""
+        if candidate == item_id or _strip_trailing_dot(candidate) == wanted:
+            return candidate
+    return None
+
+
+# --- settings table -------------------------------------------------------
+
+def _normalise_settings_table(raw):
+    """Coerce TitleData into {CODE: settings}. Rewards for cosmetics are left
+    to the catalog; only currency entries carry reward_type/reward_id."""
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -842,38 +965,45 @@ def _normalise_code_table(raw):
         code = code.strip().upper()
         if not code:
             continue
-        if isinstance(entry, str):
-            # Shorthand: "BETA": "LBAAA"
-            entry = {"reward_type": "cosmetic", "reward_id": entry}
         if not isinstance(entry, dict):
-            continue
+            entry = {}
 
-        reward_type = str(entry.get("reward_type") or "cosmetic").strip().lower()
-        if reward_type not in REDEEM_REWARD_TYPES:
-            reward_type = "cosmetic"
-        reward_id = str(entry.get("reward_id") or "").strip()
+        reward_type = str(entry.get("reward_type") or "").strip().lower()
+        if reward_type and reward_type not in REDEEM_REWARD_TYPES:
+            reward_type = ""
         try:
-            credits = int(entry.get("credits") or 0)
+            # "credits" is accepted as a legacy alias so an older settings blob
+            # keeps working.
+            amount = int(entry.get("amount") or entry.get("credits") or 0)
         except (TypeError, ValueError):
-            credits = 0
+            amount = 0
         try:
             max_uses = int(entry.get("max_uses") or 0)
         except (TypeError, ValueError):
             max_uses = 0
 
+        reward_id = str(entry.get("reward_id") or "").strip()
+        # Infer the type only when it was not stated. An amount means currency
+        # (this title uses SR and RM); otherwise a bare id is treated as a
+        # catalog item, which is the historical shape.
+        if not reward_type and reward_id:
+            reward_type = "currency" if amount > 0 else "cosmetic"
+        if reward_type == "currency" and not reward_id:
+            reward_type = ""
+
         table[code] = {
             "reward_type": reward_type,
             "reward_id": reward_id,
-            "reward_label": str(entry.get("reward_label") or reward_id or code).strip(),
-            "credits": max(0, credits),
+            "reward_label": str(entry.get("reward_label") or "").strip(),
+            "amount": max(0, amount),
             "max_uses": max(0, max_uses),
-            "enabled": bool(entry.get("enabled", True)) and (bool(reward_id) or credits > 0),
+            "enabled": entry.get("enabled", True) is not False,
             "note": str(entry.get("note") or ""),
         }
     return table
 
 
-def load_redeem_codes(force=False):
+def load_settings(force=False):
     global _redeem_codes_cache, _redeem_codes_cache_at
     now = time.time()
     if (not force and _redeem_codes_cache is not None
@@ -884,34 +1014,79 @@ def load_redeem_codes(force=False):
     ok, result = pf_request("GetTitleData", {})
     if ok:
         value = ((result.get("data") or {}).get("Data") or {}).get(REDEEM_CODES_KEY)
-        table = _normalise_code_table(value)
-    if not table:
-        # TitleData not set yet (fresh title, or a PlayFab hiccup). Fall back to
-        # the env seed so a code baked into the deployment still works.
-        table = _normalise_code_table(REDEEM_CODES_SEED)
+        table = _normalise_settings_table(value)
 
     _redeem_codes_cache = table
-    _redeem_codes_cache_at = now
     if not table:
-        # Do NOT cache an empty result. It means TitleData has no table yet or
-        # PlayFab was briefly unreachable, and caching that would serve "no
-        # codes" to every player for the whole TTL even after a code is added
-        # or PlayFab recovers.
+        # Never cache an empty table. It means "not configured yet" or a
+        # transient PlayFab failure, and caching it would hide codes that were
+        # just added for the whole TTL.
         _redeem_codes_cache_at = 0.0
+    else:
+        _redeem_codes_cache_at = now
     return table
 
 
-def save_redeem_codes(table):
+def save_settings(table):
     encoded = json.dumps(table)
     if len(encoded.encode("utf-8")) > REDEEM_CODES_MAX_BYTES:
-        return False, {"errorMessage": "code table is too large for TitleData"}
+        return False, {"errorMessage": "settings table is too large for TitleData"}
     ok, result = pf_request("SetTitleData", {
         "Key": REDEEM_CODES_KEY,
         "Value": encoded,
     })
-    load_redeem_codes(force=True)
+    load_settings(force=True)
     return ok, result
 
+
+def resolve_code(code):
+    """Merge catalog tag + settings into one entry, or None if unknown.
+
+    The catalog wins for cosmetics: a table entry cannot point a cosmetic code
+    at a different item, so marking an item is the only way to decide what a
+    cosmetic code gives.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+    settings = load_settings().get(code) or {}
+    tagged, _ = load_redeem_index()
+    from_tag = tagged.get(code)
+
+    entry = dict(settings)
+    if from_tag:
+        entry["reward_type"] = "cosmetic"
+        entry["reward_id"] = from_tag["reward_id"]
+        if not entry.get("reward_label"):
+            entry["reward_label"] = from_tag["reward_label"]
+        entry["source"] = "catalog_tag"
+    elif not entry.get("reward_type"):
+        return None
+    else:
+        entry["source"] = "settings"
+
+    # Cosmetic rewards must name an item that really exists, otherwise the grant
+    # would fail later with a confusing PlayFab error.
+    if entry.get("reward_type") == "cosmetic" and not entry.get("reward_id"):
+        return None
+    entry.setdefault("max_uses", 0)
+    entry.setdefault("enabled", True)
+    return entry
+
+
+def list_codes():
+    """Every known code: catalog-tagged cosmetics plus table entries."""
+    tagged, problems = load_redeem_index(force=True)
+    settings = load_settings(force=True)
+    merged = {}
+    for code in set(list(tagged.keys()) + list(settings.keys())):
+        entry = resolve_code(code)
+        if entry:
+            merged[code] = entry
+    return merged, problems
+
+
+# --- redemption history ---------------------------------------------------
 
 def get_player_redeemed(playfab_id):
     """Codes this player has already spent. Never raises."""
@@ -948,16 +1123,53 @@ def mark_player_redeemed(playfab_id, code, already_used):
     return ok, result
 
 
+# --- grants ---------------------------------------------------------------
+
 def grant_cosmetic(playfab_id, item_id):
     """Give a PlayFab catalog item. Never raises."""
     if not playfab_id or not item_id:
         return False, {"errorMessage": "playfab_id and item_id required"}
+    # Resolve to the catalog's own spelling so a dot-less id still resolves.
+    resolved = resolve_catalog_item_id(item_id)
+    if not resolved:
+        return False, {"errorMessage": "no catalog item matches {0}".format(item_id)}
     return pf_request("GrantCatalogItem", {
         "PlayFabId": playfab_id,
-        "ItemId": item_id,
+        "ItemId": resolved,
         "Labels": ["redeem"],
     })
 
+
+def grant_currency(playfab_id, currency_code, amount):
+    """Add PlayFab virtual currency. Never raises.
+
+    Uses the legacy AddUserVirtualCurrency because ExecuteInventoryApi 404s on
+    this title (PlayFab calls that 404 with no body, which is how an
+    un-migrated title answers it). VirtualCurrency and Amount are strings.
+    """
+    if not playfab_id or not currency_code:
+        return False, {"errorMessage": "playfab_id and currency code required"}
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return False, {"errorMessage": "amount must be a number"}
+    if amount <= 0:
+        return False, {"errorMessage": "amount must be greater than zero"}
+    return pf_request("AddUserVirtualCurrency", {
+        "PlayFabId": playfab_id,
+        "VirtualCurrency": currency_code,
+        "Amount": str(amount),
+    })
+
+
+def grant_reward(playfab_id, entry):
+    if entry.get("reward_type") == "currency":
+        return grant_currency(playfab_id, entry.get("reward_id"),
+                              entry.get("amount"))
+    return grant_cosmetic(playfab_id, entry.get("reward_id"))
+
+
+# --- discord --------------------------------------------------------------
 
 def build_redeem_embed(code, entry, playfab_id, granted):
     fields = [
@@ -967,12 +1179,12 @@ def build_redeem_embed(code, entry, playfab_id, granted):
     ]
     if entry.get("reward_id"):
         fields.append({
-            "name": "Item Id",
+            "name": "Item Id" if entry.get("reward_type") != "currency" else "Currency",
             "value": "`{0}`".format(entry["reward_id"][:64]),
             "inline": True,
         })
-    if entry.get("credits"):
-        fields.append({"name": "Credits", "value": str(entry["credits"]), "inline": True})
+    if entry.get("amount"):
+        fields.append({"name": "Amount", "value": str(entry["amount"]), "inline": True})
     fields.append({
         "name": "PlayFab ID",
         "value": "`{0}`".format((playfab_id or "Unknown")[:64]),
@@ -994,12 +1206,14 @@ def _redeem_reject(message, status=200, error=None):
         "reward_type": "",
         "reward_id": "",
         "reward_label": "",
-        "credits": 0,
+        "amount": 0,
     }
     if error:
         payload["error"] = str(error)[:200]
     return jsonify(payload), status
 
+
+# --- routes ---------------------------------------------------------------
 
 @app.route("/api/redeem", methods=["POST"])
 def redeem():
@@ -1026,8 +1240,7 @@ def redeem():
         return _redeem_reject(
             "WAIT {0} SECONDS AND TRY AGAIN.".format(retry_after), 429)
 
-    table = load_redeem_codes()
-    entry = table.get(code)
+    entry = resolve_code(code)
     if not entry:
         return _redeem_reject("CODE NOT RECOGNISED.")
     if not entry.get("enabled"):
@@ -1044,16 +1257,15 @@ def redeem():
         # Default: strictly one reward per player per code.
         return _redeem_reject("YOU HAVE ALREADY USED THAT CODE.")
 
-    if entry.get("reward_id"):
-        granted, grant_error = grant_cosmetic(playfab_id, entry["reward_id"])
-        if not granted:
-            # Deliberately do NOT burn the code here: the grant failed, so the
-            # player should be able to retry once PlayFab is reachable.
-            detail = (grant_error or {}).get("errorMessage") or "grant failed"
-            print("[redeem] grant failed for {0} -> {1}: {2}".format(
-                code, playfab_id, detail))
-            return _redeem_reject(
-                "COULD NOT GRANT THE REWARD. TRY AGAIN LATER.", 502, detail)
+    granted, grant_error = grant_reward(playfab_id, entry)
+    if not granted:
+        # Deliberately do NOT burn the code here: the grant failed, so the
+        # player should be able to retry once PlayFab is reachable.
+        detail = (grant_error or {}).get("errorMessage") or "grant failed"
+        print("[redeem] grant failed for {0} -> {1}: {2}".format(
+            code, playfab_id, detail))
+        return _redeem_reject(
+            "COULD NOT GRANT THE REWARD. TRY AGAIN LATER.", 502, detail)
 
     # Record the spend only after the grant succeeded, so a failed grant stays
     # retryable.
@@ -1070,7 +1282,7 @@ def redeem():
         "reward_type": entry.get("reward_type", "cosmetic"),
         "reward_id": entry.get("reward_id", ""),
         "reward_label": entry.get("reward_label", ""),
-        "credits": entry.get("credits", 0),
+        "amount": entry.get("amount", 0),
         "platform": platform,
         "webhook_sent": webhook_sent,
         "webhook_error": webhook_error,
@@ -1081,15 +1293,23 @@ def redeem():
 def redeem_codes_list():
     if not check_secret_request():
         return jsonify({"success": False, "error": "bad secret"}), 401
+    codes, problems = list_codes()
     return jsonify({
         "success": True,
-        "codes": load_redeem_codes(force=True),
+        "codes": codes,
+        "problems": problems,
+        "tag_prefix": REDEEM_TAG_PREFIX,
     })
 
 
 @app.route("/api/redeem-codes", methods=["POST"])
 def redeem_codes_upsert():
-    """Add, edit, disable or delete a code. Merges into the existing entry."""
+    """Change how a code behaves.
+
+    Cosmetics are NOT created here. To make a cosmetic redeemable you tag its
+    catalog item with "<REDEEM_TAG_PREFIX><CODE>"; this endpoint only holds the
+    settings, or declares a currency reward (which has no item to tag).
+    """
     body = request.get_json(silent=True) or {}
     if not check_secret(body):
         return jsonify({"success": False, "error": "bad secret"}), 401
@@ -1098,37 +1318,87 @@ def redeem_codes_upsert():
     if not code:
         return jsonify({"success": False, "error": "code required"}), 400
 
-    table = load_redeem_codes(force=True)
+    tagged, _ = load_redeem_index()
+    settings = load_settings(force=True)
+    from_tag = tagged.get(code)
 
     if body.get("delete"):
-        if code not in table:
-            return jsonify({"success": False, "error": "unknown code"}), 404
-        table.pop(code, None)
-    else:
-        merged = dict(table.get(code) or {})
-        for key in ("reward_type", "reward_id", "reward_label", "note", "enabled"):
-            if key in body:
-                merged[key] = body[key]
-        for key in ("credits", "max_uses"):
-            if key in body:
-                merged[key] = body[key]
-
-        normalised = _normalise_code_table({code: merged}).get(code)
-        if not normalised or not normalised.get("enabled"):
+        if code not in settings:
             return jsonify({
                 "success": False,
-                "error": "invalid code - needs reward_id or a credits amount",
-            }), 400
-        table[code] = normalised
+                "error": "no settings for that code (catalog tags are removed in PlayFab)",
+            }), 404
+        settings.pop(code, None)
+        ok, result = save_settings(settings)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "error": (result or {}).get("errorMessage") or "could not save",
+            }), 502
+        return jsonify({"success": True, "code": code})
 
-    ok, result = save_redeem_codes(table)
+    merged = dict(settings.get(code) or {})
+
+    # Accept reward_type/reward_id only for currency. A cosmetic's reward comes
+    # from the catalog tag, so allowing them here would create a second source
+    # of truth that could silently disagree with the tag.
+    for key in ("reward_type", "reward_id", "reward_label", "note", "enabled"):
+        if key in body:
+            merged[key] = body[key]
+    for key in ("amount", "max_uses"):
+        if key in body:
+            merged[key] = body[key]
+
+    normalised = _normalise_settings_table({code: merged}).get(code) or {}
+    reward_type = (normalised.get("reward_type") or "").strip().lower()
+    reward_id = (normalised.get("reward_id") or "").strip()
+
+    if not from_tag:
+        # No catalog item claims this code, so the table has to supply the whole
+        # reward. Anything missing here is a bad request, not a broken code.
+        if not reward_type:
+            return jsonify({
+                "success": False,
+                "error": "unknown code - tag a catalog item '{0}{1}', "
+                         "or send reward_type=currency with reward_id".format(
+                             REDEEM_TAG_PREFIX, code),
+            }), 400
+        if reward_type == "currency":
+            if not reward_id:
+                return jsonify({
+                    "success": False,
+                    "error": "a currency code needs reward_id (e.g. SR or RM)",
+                }), 400
+            if not normalised.get("amount"):
+                return jsonify({
+                    "success": False,
+                    "error": "a currency code needs a positive amount",
+                }), 400
+        else:
+            # Validate the id now rather than letting the grant fail later with
+            # a confusing PlayFab error. Worth doing because an amount-less
+            # reward_id infers "cosmetic", so a typo'd currency code lands here.
+            resolved = resolve_catalog_item_id(reward_id)
+            if not resolved:
+                return jsonify({
+                    "success": False,
+                    "error": "no catalog item matches '{0}' - if this is "
+                             "currency, set reward_type=currency and an "
+                             "amount".format(reward_id),
+                }), 400
+            # Store the catalog's own spelling so listings are unambiguous.
+            normalised["reward_id"] = resolved
+
+    settings[code] = normalised
+    ok, result = save_settings(settings)
     if not ok:
         return jsonify({
             "success": False,
             "error": (result or {}).get("errorMessage") or "could not save",
         }), 502
 
-    return jsonify({"success": True, "code": code, "codes": table})
+    entry = resolve_code(code)
+    return jsonify({"success": True, "code": code, "entry": entry})
 
 
 @app.route("/api/online-count", methods=["POST"])

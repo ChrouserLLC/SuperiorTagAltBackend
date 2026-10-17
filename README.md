@@ -127,56 +127,90 @@ The in-game **REDEEM** tab POSTs to `/api/redeem`. The client never decides what
 a code is worth; the table lives server-side in PlayFab TitleData under
 `RedeemCodes`, so you can add or change codes without redeploying.
 
-### Code table format
+### Cosmetics: tag the catalog item
+
+**Which cosmetic a code gives is decided by a tag on the item**, not by the
+backend. Add `redeem:CODE` to the item's **Tags** field in the PlayFab
+dashboard (Catalogs (Legacy) > DLC > Items). The backend scans the catalog for
+those tags, so you never copy an Item ID anywhere.
+
+```
+Item ID  LBAAC.        Tags:  redeem:BETA
+                      -> players type BETA, they get that item
+```
+
+Why tags and not Custom Data: the legacy DLC catalog does not expose Custom Data
+through any API the backend can reach. `Server/GetCatalogItems` omits the field,
+`Server/GetCatalogItem` 404s, and the catalog is not in TitleData. Tags are
+returned, so they are the only marker that works.
+
+Two things worth knowing:
+
+- **The catalog stores ItemIds with a trailing dot** (`LBAAC.`) while the game
+  uses them without (`LBAAC`). The backend resolves both spellings against the
+  real catalog, so this never bites you.
+- **A cosmetic code cannot be repointed from the table.** The catalog tag always
+  wins. To change what a cosmetic code gives, move the tag.
+
+### Currency: declare it in the table
+
+Currency has no catalog item to tag, so those live in the settings table
+(PlayFab TitleData `RedeemCodes`). This title's currencies are **SR** and **RM**.
 
 ```json
 {
-  "BETA": {
-    "reward_type":  "cosmetic",
-    "reward_id":    "LBAAA",
-    "reward_label": "BETA TESTER",
-    "credits":      0,
-    "max_uses":     0,
-    "enabled":      true,
-    "note":         "internal note, never shown to players"
-  }
+  "BETA": { "enabled": true, "max_uses": 0, "note": "announcement" },
+  "GOLD": { "reward_type": "currency", "reward_id": "SR", "amount": 5000,
+            "reward_label": "5000 SHINY ROCKS" }
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `reward_id` | **The important one.** A PlayFab catalog `ItemId`. Granted via `GrantCatalogItem`. |
-| `reward_label` | What the player is shown in-game. Defaults to `reward_id`. |
-| `reward_type` | `cosmetic` or `credits`. GorillaNetworking has no separate currency, so `credits` is also just a catalog item. |
-| `credits` | Display only, when `reward_type` is `credits`. |
-| `max_uses` | Times **one player** may redeem it. `0` = unlimited. |
-| `enabled` | `false` retires the code without deleting it. |
+| `reward_id` | A currency code (`SR` / `RM`) when `reward_type` is `currency`. |
+| `amount` | How much currency to grant. |
+| `reward_label` | What the player is shown in-game. |
+| `max_uses` | Times **one player** may redeem it. `0` = once. |
+| `enabled` | `false` retires the code without touching PlayFab. |
+| `note` | Internal, never shown to players. |
 
-A string value is accepted as shorthand: `"BETA": "LBAAA"`.
+An entry with a `reward_id` and an `amount` infers `currency`; with a
+`reward_id` and no amount it infers `cosmetic` and is validated against the
+catalog on save.
 
 ### Managing codes
 
 ```bash
-# Create or update (merges into the existing entry)
+# Set a label on a code that already has a catalog tag
 curl -X POST https://<domain>/api/redeem-codes \
   -H 'Content-Type: application/json' \
-  -d '{"secret":"<API_SECRET>","code":"BETA","reward_id":"LBAAA","reward_label":"Beta Tester"}'
+  -d '{"secret":"<API_SECRET>","code":"BETA","reward_label":"Beta Tester"}'
 
-# List
+# Create a currency code
+curl -X POST https://<domain>/api/redeem-codes \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"<API_SECRET>","code":"GOLD","reward_type":"currency","reward_id":"SR","amount":5000}'
+
+# List every code, with problems reported alongside
 curl https://<domain>/api/redeem-codes -H 'X-Api-Secret: <API_SECRET>'
 
-# Disable
+# Disable (leaves the catalog tag alone)
 curl -X POST https://<domain>/api/redeem-codes \
   -H 'Content-Type: application/json' \
   -d '{"secret":"<API_SECRET>","code":"BETA","enabled":false}'
 
-# Delete
+# Delete the settings entry (a catalog tag is removed in the PlayFab dashboard)
 curl -X POST https://<domain>/api/redeem-codes \
   -H 'Content-Type: application/json' \
   -d '{"secret":"<API_SECRET>","code":"BETA","delete":true}'
 ```
 
 Codes are case-insensitive; everything is stored upper-cased.
+
+`GET /api/redeem-codes` also returns a `problems` array — for example if two
+items claim the same code, or an item carries a bare `redeem:` tag with nothing
+after it. Duplicates are not silently resolved: the first item wins and the clash
+is reported.
 
 ### How "already used" is tracked
 
@@ -187,14 +221,23 @@ redemption history.
 
 ### Failure behaviour
 
-If `GrantCatalogItem` fails (bad item id, unknown player, PlayFab down) the
-endpoint returns **502** and the code is **not** marked as spent, so the player
-can retry. Only a successful grant burns the code. The underlying PlayFab error
-is printed to the server log and returned in the JSON `error` field.
+If the grant fails — bad item id, unknown player, PlayFab down — the endpoint
+returns **502** and the code is **not** marked as spent, so the player can retry.
+Only a successful grant burns the code. The underlying PlayFab error is printed
+to the server log as `[redeem] grant failed` and returned in the JSON `error`
+field.
+
+Cosmetic reward ids are validated against the real catalog when you save them,
+so a typo fails immediately with a clear message instead of failing silently at
+redemption time.
 
 ### Limits
 
-PlayFab caps a TitleData value at 4000 bytes, so the whole code table must stay
+The catalog is cached for 60s and the settings table for 30s, so changes take
+that long to appear everywhere. If a catalog fetch fails, the previous catalog
+is kept rather than blanking the code list.
+
+PlayFab caps a TitleData value at 4000 bytes, so the settings table must stay
 under that. The endpoint refuses to save a larger table rather than letting
 PlayFab truncate it into unparseable JSON.
 

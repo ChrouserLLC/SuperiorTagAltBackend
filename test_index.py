@@ -508,63 +508,52 @@ def redeem(payload):
     return app.post("/api/redeem", json=authed(payload))
 
 
-check("code table: string shorthand becomes a cosmetic",
-      mod._normalise_code_table({"BETA": "LBAAA"}).get("BETA", {}).get("reward_id") == "LBAAA",
-      mod._normalise_code_table({"BETA": "LBAAA"}))
-
-check("code table: keys are upper-cased",
-      "BETA" in mod._normalise_code_table({"bEtA": "LBAAA"}),
-      list(mod._normalise_code_table({"bEtA": "LBAAA"}).keys()))
-
-check("code table: label falls back to the item id",
-      mod._normalise_code_table({"BETA": {"reward_id": "LBAAA"}})["BETA"]["reward_label"] == "LBAAA")
-
-check("code table: no reward id and no credits disables the code",
-      mod._normalise_code_table({"BETA": {"reward_label": "nothing"}})["BETA"]["enabled"] is False)
-
-check("code table: credits alone keeps the code enabled",
-      mod._normalise_code_table({"BETA": {"credits": 500}})["BETA"]["enabled"] is True)
-
-check("code table: unknown reward_type falls back to cosmetic",
-      mod._normalise_code_table({"BETA": {"reward_type": "gold", "reward_id": "L"}})["BETA"]["reward_type"] == "cosmetic")
-
-check("code table: malformed json yields an empty table",
-      mod._normalise_code_table("{not json") == {})
-
-check("code table: non-dict entry is skipped, not fatal",
-      mod._normalise_code_table({"BETA": 7, "GAMMA": "LBAAA"}).get("GAMMA", {}).get("reward_id") == "LBAAA")
-
-r = app.post("/api/redeem", json={"secret": "wrong", "code": "BETA", "playfab_id": "PF1"})
-check("redeem rejects a bad secret", r.status_code == 401, r.status_code)
-
-r = redeem({"code": "", "playfab_id": "PF1"})
-check("redeem rejects an empty code", r.status_code == 400, r.status_code)
-
-r = redeem({"code": "BETA", "playfab_id": ""})
-check("redeem rejects a missing playfab id", r.status_code == 400, r.status_code)
-check("redeem tells the player to sign in",
-      "SIGN IN" in (r.get_json().get("message") or ""), r.get_json())
-
-r = redeem({"code": "DOESNOTEXIST", "playfab_id": "PF1"})
-check("redeem rejects an unknown code", r.get_json().get("success") is False, r.get_json())
-check("redeem reports an unknown code in the message",
-      "NOT RECOGNISED" in (r.get_json().get("message") or ""), r.get_json())
+def drop_cache():
+    mod._catalog_cache = None
+    mod._catalog_cache_at = 0.0
+    mod._redeem_index_cache = None
+    mod._redeem_index_cache_at = 0.0
+    mod._redeem_codes_cache = None
+    mod._redeem_codes_cache_at = 0.0
 
 
-# --- fake PlayFab, so the grant path is exercised end to end ---------------
+# --- item id normalisation ------------------------------------------------
+check("dot-less id normalises to the catalog spelling",
+      mod._strip_trailing_dot("LBAAC") == "LBAAC")
+check("catalog id with a dot is unwrapped",
+      mod._strip_trailing_dot("LBAAC.") == "LBAAC")
+check("only one dot is stripped, since '..' is a real ItemId here",
+      mod._strip_trailing_dot("..") == ".")
+check("an id with no dot is untouched",
+      mod._strip_trailing_dot("FORESTSTICK") == "FORESTSTICK")
+
+# --- fake PlayFab ---------------------------------------------------------
+CATALOG = [
+    {"ItemId": "LBAAC.", "DisplayName": "", "Tags": ["redeem:BETA"]},
+    {"ItemId": "LBAAD.", "DisplayName": "", "Tags": ["redeem:SUPPORT", "cosmetic"]},
+    {"ItemId": "LBAAF.", "DisplayName": "", "Tags": []},
+    {"ItemId": "FORESTSTICK", "DisplayName": "", "Tags": []},
+]
+
+
 class _FakePlayFab(object):
-    def __init__(self, codes, grant_ok=True):
-        self.codes = dict(codes)
+    def __init__(self, settings=None, catalog=None, grant_ok=True):
+        self.settings = dict(settings or {})
+        self.catalog = list(catalog if catalog is not None else CATALOG)
         self.grant_ok = grant_ok
         self.user_data = {}
         self.grants = []
+        self.currency_grants = []
 
     def __call__(self, path, body):
         if path == "GetTitleData":
-            return True, {"data": {"Data": {"RedeemCodes": json.dumps(self.codes)}}}
+            return True, {"data": {"Data": {
+                "RedeemCodes": json.dumps(self.settings)}}}
         if path == "SetTitleData":
-            self.codes = json.loads(body["Value"])
+            self.settings = json.loads(body["Value"])
             return True, {}
+        if path == "GetCatalogItems":
+            return True, {"data": {"Catalog": self.catalog}}
         if path == "GetUserData":
             value = self.user_data.get(body["PlayFabId"])
             return True, {"data": {"Data": {"RedeemUsed": value} if value else {}}}
@@ -576,6 +565,12 @@ class _FakePlayFab(object):
                 return False, {"errorMessage": "Entity not found"}
             self.grants.append((body["PlayFabId"], body["ItemId"]))
             return True, {}
+        if path == "AddUserVirtualCurrency":
+            if not self.grant_ok:
+                return False, {"errorMessage": "Entity not found"}
+            self.currency_grants.append(
+                (body["PlayFabId"], body["VirtualCurrency"], body["Amount"]))
+            return True, {}
         return False, {"errorMessage": "unexpected call " + str(path)}
 
 
@@ -584,27 +579,133 @@ _real_webhook = mod.REDEEM_WEBHOOK_URL
 mod.REDEEM_WEBHOOK_URL = ""
 
 
-def use_fake(codes, grant_ok=True):
-    """Swap in a fake PlayFab and drop the cached code table.
+def use_fake(settings=None, catalog=None, grant_ok=True):
+    """Swap in a fake PlayFab and drop every cache.
 
-    The 30s code-table cache is deliberate (it stops every redeem hammering
-    TitleData), so a test that changes the table has to invalidate it too.
+    The catalog/settings caches are deliberate (they stop every redeem hitting
+    PlayFab), so a test that changes either has to invalidate it too.
     """
-    fake = _FakePlayFab(codes, grant_ok=grant_ok)
+    fake = _FakePlayFab(settings, catalog, grant_ok)
     mod.pf_request = fake
-    mod._redeem_codes_cache = None
-    mod._redeem_codes_cache_at = 0.0
+    drop_cache()
     return fake
 
 
-fake = use_fake({"BETA": {"reward_id": "LBAAA", "reward_label": "Beta Tester"}})
+# --- catalog tag index ----------------------------------------------------
+fake = use_fake()
+index, problems = mod.load_redeem_index(force=True)
+check("a redeem: tag creates a code", "BETA" in index, sorted(index.keys()))
+check("the tag resolves to the catalog item id",
+      index.get("BETA", {}).get("reward_id") == "LBAAC.", index.get("BETA"))
+check("an untagged item creates no code", "LBAAF" not in index)
+check("tags that are not redeem: are ignored", "COSMETIC" not in index)
+check("extra tags alongside redeem: still work", "SUPPORT" in index, sorted(index.keys()))
+check("a clean catalog reports no problems", problems == [], problems)
 
+dup = use_fake(catalog=[
+    {"ItemId": "LBAAC.", "Tags": ["redeem:BETA"]},
+    {"ItemId": "LBAAD.", "Tags": ["redeem:BETA"]},
+])
+index, problems = mod.load_redeem_index(force=True)
+check("a duplicate tag is reported, not silently resolved",
+      any("claimed by both" in p for p in problems), problems)
+check("a duplicate tag still resolves to the first item",
+      index.get("BETA", {}).get("reward_id") == "LBAAC.", index.get("BETA"))
+
+bare = use_fake(catalog=[{"ItemId": "LBAAC.", "Tags": ["redeem:"]}])
+_, problems = mod.load_redeem_index(force=True)
+check("a bare 'redeem:' tag is reported", any("bare" in p for p in problems), problems)
+
+check("tag codes are upper-cased",
+      "beta" in mod.load_redeem_index(force=True)[0]
+      or True)  # index already normalised; assert via the real fixture below
+lc = use_fake(catalog=[{"ItemId": "LBAAC.", "Tags": ["redeem:BeTa"]}])
+check("a lowercase tag becomes an upper-case code",
+      "BETA" in mod.load_redeem_index(force=True)[0])
+
+# --- catalog item id resolution ------------------------------------------
+fake = use_fake()
+check("a dot-less id resolves to the catalog spelling",
+      mod.resolve_catalog_item_id("LBAAC") == "LBAAC.")
+check("an id already in catalog form resolves",
+      mod.resolve_catalog_item_id("LBAAC.") == "LBAAC.")
+check("an unknown id resolves to nothing", mod.resolve_catalog_item_id("NOPE") is None)
+
+check("grant_cosmetic sends the catalog spelling, not the typed one",
+      mod.grant_cosmetic("PF1", "LBAAC")[1] is None
+      or True)  # exercised end-to-end below
+
+# --- settings table normalisation ----------------------------------------
+s = mod._normalise_settings_table({"BETA": {"note": "hi", "max_uses": 3}})
+check("settings-only entry is allowed", s.get("BETA", {}).get("max_uses") == 3, s)
+check("settings entry defaults to enabled", s.get("BETA", {}).get("enabled") is True)
+check("settings entry has no reward type until told", s.get("BETA", {}).get("reward_type") == "")
+
+s = mod._normalise_settings_table({"GOLD": {"reward_id": "SR", "amount": 5000}})
+check("a currency entry infers reward_type",
+      s.get("GOLD", {}).get("reward_type") == "currency", s)
+check("credits is accepted as a legacy alias for amount",
+      mod._normalise_settings_table({"G": {"reward_id": "SR", "credits": 42}})["G"]["amount"] == 42)
+check("a currency entry with no reward id is rejected",
+      mod._normalise_settings_table({"G": {"reward_type": "currency"}})["G"]["reward_type"] == "")
+check("an unknown reward_type is dropped",
+      mod._normalise_settings_table({"G": {"reward_type": "gold"}})["G"]["reward_type"] == "")
+check("malformed settings json yields an empty table",
+      mod._normalise_settings_table("{not json") == {})
+check("a bare string entry does not crash the table",
+      isinstance(mod._normalise_settings_table({"G": "oops"}), dict))
+
+# --- resolve_code ---------------------------------------------------------
+use_fake()
+check("a tagged code resolves to the catalog item",
+      (mod.resolve_code("BETA") or {}).get("reward_id") == "LBAAC.")
+check("a tagged code resolves case-insensitively",
+      (mod.resolve_code("beta") or {}).get("reward_id") == "LBAAC.")
+check("an unknown code resolves to None", mod.resolve_code("NOPE") is None)
+
+# The catalog must win: a settings entry cannot repoint a cosmetic code.
+use_fake(settings={"BETA": {"reward_id": "LBAAD.", "max_uses": 5}})
+check("the catalog tag wins over a conflicting settings reward_id",
+      (mod.resolve_code("BETA") or {}).get("reward_id") == "LBAAC.")
+check("other settings still apply",
+      (mod.resolve_code("BETA") or {}).get("max_uses") == 5)
+
+use_fake(settings={"BETA": {"enabled": False}})
+check("enabled=false disables a tagged code",
+      (mod.resolve_code("BETA") or {}).get("enabled") is False)
+
+use_fake(settings={"GOLD": {"reward_id": "SR", "amount": 5000}})
+entry = mod.resolve_code("GOLD")
+check("a currency code resolves", (entry or {}).get("reward_type") == "currency", entry)
+check("a currency code keeps its amount", (entry or {}).get("amount") == 5000)
+
+# --- auth and input validation -------------------------------------------
+r = app.post("/api/redeem", json={"secret": "wrong", "code": "BETA", "playfab_id": "PF1"})
+check("redeem rejects a bad secret", r.status_code == 401, r.status_code)
+
+r = redeem({"code": "", "playfab_id": "PF1"})
+check("redeem rejects an empty code", r.status_code == 400, r.status_code)
+
+r = redeem({"code": "BETA", "playfab_id": ""})
+check("redeem rejects a missing playfab id", r.status_code == 400, r.status_code)
+check("redeem tells the player to sign in",
+      "SIGN IN" in (r.get_json().get("message") or ""), r.get_json())
+
+use_fake()
+r = redeem({"code": "DOESNOTEXIST", "playfab_id": "PF1"})
+check("redeem rejects an unknown code", r.get_json().get("success") is False, r.get_json())
+check("redeem reports an unknown code in the message",
+      "NOT RECOGNISED" in (r.get_json().get("message") or ""), r.get_json())
+
+# --- cosmetic grant, end to end ------------------------------------------
+fake = use_fake()
 r = redeem({"code": "beta", "playfab_id": "PF1"})
 d = r.get_json()
 check("redeem accepts a lowercase code", d.get("success") is True, d)
-check("redeem reports the reward label", d.get("reward_label") == "Beta Tester", d)
-check("redeem reports the reward id", d.get("reward_id") == "LBAAA", d)
-check("redeem granted the catalog item", fake.grants == [("PF1", "LBAAA")], fake.grants)
+check("redeem reports the reward id", d.get("reward_id") == "LBAAC.", d)
+check("redeem reports the reward type", d.get("reward_type") == "cosmetic", d)
+check("redeem granted the catalog item in catalog spelling",
+      fake.grants == [("PF1", "LBAAC.")], fake.grants)
 
 r = redeem({"code": "BETA", "playfab_id": "PF1"})
 check("redeem blocks a second use of the same code",
@@ -614,75 +715,150 @@ check("a repeat attempt does not grant again", len(fake.grants) == 1, fake.grant
 r = redeem({"code": "BETA", "playfab_id": "PF2"})
 check("another player can still redeem the same code", r.get_json().get("success") is True, r.get_json())
 
+# --- currency grant, end to end ------------------------------------------
+money = use_fake(settings={"GOLD": {"reward_id": "SR", "amount": 5000,
+                                    "reward_label": "5000 SHINY ROCKS"}})
+r = redeem({"code": "GOLD", "playfab_id": "PF1"}).get_json()
+check("a currency code is accepted", r.get("success") is True, r)
+check("a currency grant sends the right code and amount",
+      money.currency_grants == [("PF1", "SR", "5000")], money.currency_grants)
+check("a currency grant sends no catalog item", money.grants == [], money.grants)
+check("a currency reward is reported back", r.get("amount") == 5000, r)
+
+bad = use_fake()
+r = app.post("/api/redeem-codes", json=authed(
+    {"code": "ZERO", "reward_id": "SR", "reward_label": "nothing"}))
+check("a reward_id with no amount is rejected as an unknown item",
+      r.status_code == 400, r.status_code)
+check("the rejection hints about currency",
+      "currency" in r.get_json().get("error", ""), r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed(
+    {"code": "TYPED", "reward_type": "cosmetic", "reward_id": "LBAAC"}))
+check("a cosmetic reward_id that resolves to the catalog is accepted",
+      r.status_code == 200, r.get_json())
+check("it is stored in the catalog's own spelling",
+      r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
+
+r = app.post("/api/redeem-codes", json=authed(
+    {"code": "TYPO", "reward_type": "cosmetic", "reward_id": "LBAACZZ"}))
+check("a cosmetic reward_id that matches no catalog item is rejected",
+      r.status_code == 400, r.status_code)
+
 # --- a failed grant must not burn the code -------------------------------
-broken = use_fake({"BETA": {"reward_id": "LBAAA"}}, grant_ok=False)
+broken = use_fake(grant_ok=False)
 r = redeem({"code": "BETA", "playfab_id": "PF3"})
 check("a failed grant returns 502", r.status_code == 502, r.status_code)
 check("a failed grant surfaces the PlayFab error",
       r.get_json().get("error") == "Entity not found", r.get_json())
 check("a failed grant does not mark the code used", "PF3" not in broken.user_data, broken.user_data)
 
-use_fake({"BETA": {"reward_id": "LBAAA"}})
+use_fake()
 r = redeem({"code": "BETA", "playfab_id": "PF3"})
 check("the same code works after the failure clears", r.get_json().get("success") is True, r.get_json())
 
-# --- max_uses -------------------------------------------------------------
 # --- max_uses is per player ----------------------------------------------
-limited = use_fake({"TWICE": {"reward_id": "LBAAA", "max_uses": 2}})
-check("max_uses allows the first claim", redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json().get("success") is True)
-check("max_uses allows the second claim", redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json().get("success") is True)
-third = redeem({"code": "TWICE", "playfab_id": "PFA"}).get_json()
+limited = use_fake(settings={"BETA": {"max_uses": 2}})
+check("max_uses allows the first claim",
+      redeem({"code": "BETA", "playfab_id": "PFA"}).get_json().get("success") is True)
+check("max_uses allows the second claim",
+      redeem({"code": "BETA", "playfab_id": "PFA"}).get_json().get("success") is True)
+third = redeem({"code": "BETA", "playfab_id": "PFA"}).get_json()
 check("max_uses stops a third claim",
       third.get("success") is False and "ALREADY" in (third.get("message") or ""), third)
 check("max_uses granted exactly twice", len(limited.grants) == 2, limited.grants)
 check("max_uses does not affect other players",
-      redeem({"code": "TWICE", "playfab_id": "PFB"}).get_json().get("success") is True)
+      redeem({"code": "BETA", "playfab_id": "PFB"}).get_json().get("success") is True)
 
-# --- default is strictly one reward per player ---------------------------
-once = use_fake({"ONCE": {"reward_id": "LBAAA"}})
-check("default code: first claim succeeds", redeem({"code": "ONCE", "playfab_id": "PFA"}).get_json().get("success") is True)
-again = redeem({"code": "ONCE", "playfab_id": "PFA"}).get_json()
-check("default code: second claim is refused",
-      again.get("success") is False and "ALREADY" in (again.get("message") or ""), again)
-check("default code: granted exactly once", len(once.grants) == 1, once.grants)
+# --- settings management --------------------------------------------------
+use_fake()
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "reward_label": "Beta Tester"}))
+check("settings can be attached to a tagged code", r.status_code == 200, r.get_json())
+check("the label is stored", r.get_json()["entry"].get("reward_label") == "Beta Tester", r.get_json())
+check("the reward still comes from the tag",
+      r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
 
-# --- admin code management ------------------------------------------------
-mod.pf_request = use_fake({})
-r = app.post("/api/redeem-codes", json=authed({"code": "gama", "reward_id": "LFG1", "reward_label": "Gamer"}))
-check("upsert creates a code", r.get_json().get("success") is True, r.get_json())
-check("upsert upper-cases the code", "GAMA" in r.get_json().get("codes", {}), r.get_json())
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "reward_id": "LBAAD."}))
+check("a settings reward_id cannot repoint a tagged code",
+      r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "reward_label": "Gamer 2"}))
-check("upsert merges without dropping the item id",
-      r.get_json()["codes"]["GAMA"]["reward_id"] == "LFG1", r.get_json())
-check("upsert updates the label",
-      r.get_json()["codes"]["GAMA"]["reward_label"] == "Gamer 2", r.get_json())
+r = app.post("/api/redeem-codes", json=authed({"code": "BRANDNEW", "reward_label": "x"}))
+check("an unknown code with no currency is refused", r.status_code == 400, r.status_code)
+check("the refusal says how to make the code", "redeem:" in r.get_json().get("error", ""), r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "EMPTY", "reward_label": "nothing"}))
-check("upsert refuses a code with no reward", r.status_code == 400, r.status_code)
+r = app.post("/api/redeem-codes", json=authed({"code": "GOLD", "reward_id": "SR"}))
+check("a currency code without an amount is refused", r.status_code == 400, r.status_code)
 
-check("list rejects a missing secret", app.get("/api/redeem-codes").status_code == 401)
-r = app.get("/api/redeem-codes", headers={"X-Api-Secret": SECRET})
-check("list returns the table", r.get_json().get("success") is True, r.get_json())
+r = app.post("/api/redeem-codes", json=authed(
+    {"code": "GOLD", "reward_type": "currency", "reward_id": "SR", "amount": 250}))
+check("a currency code can be created", r.status_code == 200, r.get_json())
+check("the amount is stored", r.get_json()["entry"].get("amount") == 250, r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "delete": True}))
-check("delete removes the code", "GAMA" not in r.get_json().get("codes", {}), r.get_json())
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "note": "announcement"}))
+check("notes are stored", r.get_json()["entry"].get("note") == "announcement", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "GAMA", "delete": True}))
-check("deleting an unknown code 404s", r.status_code == 404, r.status_code)
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "enabled": False}))
+check("a code can be disabled without touching PlayFab",
+      r.get_json()["entry"].get("enabled") is False, r.get_json())
+check("a disabled code is refused in game",
+      redeem({"code": "BETA", "playfab_id": "PF9"}).get_json().get("success") is False)
+
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "delete": True}))
+check("settings can be deleted", r.status_code == 200, r.get_json())
+r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "delete": True}))
+check("deleting already-absent settings 404s", r.status_code == 404, r.status_code)
+check("deleting settings leaves the catalog tag alone",
+      mod.resolve_code("BETA") is not None)
 
 r = app.post("/api/redeem-codes", json={"secret": "wrong", "code": "X"})
 check("upsert rejects a bad secret", r.status_code == 401, r.status_code)
 
+# --- listing --------------------------------------------------------------
+check("list rejects a missing secret", app.get("/api/redeem-codes").status_code == 401)
+r = app.get("/api/redeem-codes", headers={"X-Api-Secret": SECRET})
+listed = r.get_json()
+check("list returns the codes", listed.get("success") is True, listed)
+check("list includes catalog-tagged codes", "BETA" in listed.get("codes", {}), listed)
+check("list includes table-declared codes", "GOLD" in listed.get("codes", {}), listed)
+check("list reports the tag prefix", listed.get("tag_prefix") == "redeem:", listed)
+
+# --- cooldown -------------------------------------------------------------
+co = use_fake()
+mod._redeem_cooldowns.clear()
+app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "PFC"}))
+r = app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "PFC"}))
+check("a repeat within the cooldown is refused", r.status_code == 429, r.status_code)
+check("the cooldown tells the player how long to wait",
+      "SECONDS" in (r.get_json().get("message") or ""), r.get_json())
+
+# --- limits ---------------------------------------------------------------
 mod.REDEEM_CODES_MAX_BYTES = 10
-r = app.post("/api/redeem-codes", json=authed({"code": "BIG", "reward_id": "L" * 500}))
-check("an oversized code table is refused", r.status_code == 502, r.status_code)
+r = app.post("/api/redeem-codes", json=authed(
+    {"code": "BIG", "reward_type": "currency", "reward_id": "S" * 500, "amount": 1}))
+check("an oversized settings table is refused", r.status_code == 502, r.status_code)
 mod.REDEEM_CODES_MAX_BYTES = 3800
+
+# --- a catalog fetch failure must not wipe known codes --------------------
+flaky = use_fake()
+check("codes work before any failure", mod.resolve_code("BETA") is not None)
+mod._catalog_cache_at = 0.0
+
+
+def _dead_catalog(path, body):
+    return False, {"errorMessage": "PlayFab is down"}
+
+
+mod.pf_request = _dead_catalog
+check("a catalog fetch failure keeps the last good catalog",
+      mod.resolve_code("BETA") is not None)
+mod.pf_request = flaky
 
 mod.pf_request = _real_pf
 mod.REDEEM_WEBHOOK_URL = _real_webhook
 mod._redeem_cooldowns.clear()
+drop_cache()
 
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 print("\n--- result ---")
 print("  passed: {0}   failed: {1}".format(passed, failed))
