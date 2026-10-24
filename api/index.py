@@ -33,8 +33,8 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "12304A")
-PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "9U76KWPK7KPWTJNBDJ5AW4MDYGZ688C4XRQZBFYI33O7NZ7HTN")
+PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "18175B")
+PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "AJM5UPP1CPMXZOWIE1X5MRCJ59HBYCO3P855ASPJJ8KCFW65M5")
 
 # One shared secret for every client-facing endpoint. The original services each
 # had their own (REPORT_SECRET / TRACKER_SECRET); a single value means the Unity
