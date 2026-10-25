@@ -36,19 +36,36 @@ function canInstaBan(playerId) {
 }
 
 handlers.InstaBanReport = function (args) {
-    var reporterId = args && args.reporterPlayFabId;
+    // The reporter is ALWAYS the player this CloudScript runs as. Never take it
+    // from args: CloudScript handlers can be called straight from any game
+    // client (Client/ExecuteCloudScript), so an args value is attacker-chosen -
+    // anyone could pass a moderator's PlayFab ID and ban whoever they like.
+    // currentPlayerId is set by PlayFab from the caller's own session (or, for
+    // the backend's Server/ExecuteCloudScript call, from the PlayFab ID the
+    // backend verified from the reporter's session ticket).
+    var reporterId = currentPlayerId;
     var reportedId = args && args.reportedPlayFabId;
-    var reason = (args && args.reason) || "";
+    var reason = String((args && args.reason) || "").substring(0, 64);
 
     if (!reportedId) {
         return { success: false, banned: false, reason: "reportedPlayFabId required" };
     }
     if (!reporterId) {
-        return { success: false, banned: false, reason: "reporterPlayFabId required" };
+        return { success: false, banned: false, reason: "no calling player" };
+    }
+    if (args && args.reporterPlayFabId && args.reporterPlayFabId !== reporterId) {
+        return { success: false, banned: false, reason: "reporter_mismatch" };
+    }
+    if (reportedId === reporterId) {
+        return { success: false, banned: false, reason: "cannot_ban_self" };
     }
     // Authorisation lives here, not in the Flask layer.
     if (!canInstaBan(reporterId)) {
         return { success: false, banned: false, reason: "reporter_not_authorized" };
+    }
+    // Staff cannot insta-ban other insta-ban staff.
+    if (canInstaBan(reportedId)) {
+        return { success: false, banned: false, reason: "target_is_staff" };
     }
 
     try {

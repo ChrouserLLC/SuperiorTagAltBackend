@@ -19,6 +19,7 @@ except AttributeError:
     pass
 
 os.environ.setdefault("API_SECRET", "test-secret-123")
+os.environ.setdefault("ADMIN_SECRET", "test-admin-456")
 os.environ.setdefault("PLAYFAB_TITLE_ID", "")
 os.environ.setdefault("PLAYFAB_SECRET_KEY", "")
 os.environ.setdefault("TRACKER_WEBHOOK_URL", "")
@@ -32,6 +33,7 @@ spec.loader.exec_module(mod)
 app = mod.app.test_client()
 
 SECRET = "test-secret-123"
+ADMIN = "test-admin-456"
 
 passed = 0
 failed = 0
@@ -50,6 +52,12 @@ def check(name, cond, extra=""):
 def authed(payload):
     payload = dict(payload)
     payload["secret"] = SECRET
+    return payload
+
+
+def admin(payload):
+    payload = dict(payload)
+    payload["secret"] = ADMIN
     return payload
 
 
@@ -287,7 +295,7 @@ check("repair leaves empty lists empty",
 r = app.get("/api/tracker/tracked")
 check("tracked requires a secret", r.status_code == 401, r.status_code)
 
-r = app.get("/api/tracker/tracked", headers={"X-Api-Secret": SECRET})
+r = app.get("/api/tracker/tracked", headers={"X-Api-Secret": ADMIN})
 check("tracked accepts the header secret", r.status_code == 200, r.status_code)
 check("tracked returns 4 keys",
       sorted(k for k in r.get_json() if k != "success") == ["admins", "content_creators", "moderators", "owners"],
@@ -296,7 +304,7 @@ check("tracked returns 4 keys",
 r = app.get("/api/tracker/tracked", headers={"X-Api-Secret": "wrong"})
 check("tracked rejects a bad header secret", r.status_code == 401, r.status_code)
 
-r = app.post("/api/tracker/refresh", json=authed({}))
+r = app.post("/api/tracker/refresh", json=admin({}))
 check("refresh 200", r.status_code == 200, r.status_code)
 check("refresh success true", r.get_json().get("success") is True, r.get_json())
 
@@ -323,7 +331,7 @@ mod._online_global_at = 0
 mod._online_global_count = 0
 mod.touch_online("AABBCCDDEEFF00112233445566778899", "Alice")
 mod.touch_online("99887766554433221100FFEEDDCCBBAA", "Bob")
-r = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET})
+r = app.get("/api/dashboard", headers={"X-Api-Secret": ADMIN})
 check("dashboard data 200 with secret", r.status_code == 200, r.status_code)
 d = r.get_json()
 check("dashboard success true", d.get("success") is True, d)
@@ -340,7 +348,7 @@ check("dashboard has a timestamp", bool(d.get("generated_at")), d)
 
 # a later event with a better name should update, not duplicate
 mod.touch_online("AABBCCDDEEFF00112233445566778899", "AliceRenamed")
-d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+d = app.get("/api/dashboard", headers={"X-Api-Secret": ADMIN}).get_json()
 check("re-touch updates the name in place", d.get("player_count") == 2, d)
 check("re-touch uses the newest name",
       "AliceRenamed" in {p["display_name"] for p in d["players"]}, d["players"])
@@ -350,13 +358,13 @@ check("re-touch uses the newest name",
 # blanked on nearly every request.
 mod._online_global_at = time.time()
 mod._online_global_count = 5
-d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+d = app.get("/api/dashboard", headers={"X-Api-Secret": ADMIN}).get_json()
 check("fresh global count keeps the player list", len(d.get("players") or []) == 2, d)
 check("fresh global count is the source", d.get("source") == "global_count", d)
 check("headline prefers the higher count", d.get("online") == 5, d)
 
 mod._online_global_count = 1
-d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+d = app.get("/api/dashboard", headers={"X-Api-Secret": ADMIN}).get_json()
 check("headline never under-reports the registry", d.get("online") == 2, d)
 
 # clear the global count again so later /api/online tests exercise the registry
@@ -365,7 +373,7 @@ mod._online_global_count = 0
 
 # a later event with a better name should update, not duplicate
 mod.touch_online("AABBCCDDEEFF00112233445566778899", "AliceRenamed")
-d = app.get("/api/dashboard", headers={"X-Api-Secret": SECRET}).get_json()
+d = app.get("/api/dashboard", headers={"X-Api-Secret": ADMIN}).get_json()
 check("re-touch updates the name in place", d.get("player_count") == 2, d)
 check("re-touch uses the newest name",
       "AliceRenamed" in {p["display_name"] for p in d["players"]}, d["players"])
@@ -377,7 +385,7 @@ check("online 200 without a secret", r.status_code == 200, r.status_code)
 check("online withholds the player list", "players" not in r.get_json(), r.get_json())
 check("online still returns a count", isinstance(r.get_json().get("online"), int), r.get_json())
 
-r = app.get("/api/online", headers={"X-Api-Secret": SECRET})
+r = app.get("/api/online", headers={"X-Api-Secret": ADMIN})
 # snapshot is sorted by id, so '9' sorts before 'A'
 check("online reveals the sorted id list to a valid secret",
       r.get_json().get("players") == ["99887766554433221100FFEEDDCCBBAA",
@@ -388,7 +396,7 @@ r = app.get("/api/tracker/tracked")
 check("rosters withheld without a secret", r.status_code == 401, r.status_code)
 
 # secret must not be accepted from the query string (it would land in logs)
-r = app.get("/api/dashboard?secret=" + SECRET)
+r = app.get("/api/dashboard?secret=" + ADMIN)
 check("query-string secret is not accepted", r.status_code == 401, r.status_code)
 
 # ---------------------------------------------------------------------------
@@ -748,21 +756,21 @@ check("a currency grant sends no catalog item", money.grants == [], money.grants
 check("a currency reward is reported back", r.get("amount") == 5000, r)
 
 bad = use_fake()
-r = app.post("/api/redeem-codes", json=authed(
+r = app.post("/api/redeem-codes", json=admin(
     {"code": "ZERO", "reward_id": "SR", "reward_label": "nothing"}))
 check("a reward_id with no amount is rejected as an unknown item",
       r.status_code == 400, r.status_code)
 check("the rejection hints about currency",
       "currency" in r.get_json().get("error", ""), r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed(
+r = app.post("/api/redeem-codes", json=admin(
     {"code": "TYPED", "reward_type": "cosmetic", "reward_id": "LBAAC"}))
 check("a cosmetic reward_id that resolves to the catalog is accepted",
       r.status_code == 200, r.get_json())
 check("it is stored in the catalog's own spelling",
       r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed(
+r = app.post("/api/redeem-codes", json=admin(
     {"code": "TYPO", "reward_type": "cosmetic", "reward_id": "LBAACZZ"}))
 check("a cosmetic reward_id that matches no catalog item is rejected",
       r.status_code == 400, r.status_code)
@@ -794,40 +802,40 @@ check("max_uses does not affect other players",
 
 # --- settings management --------------------------------------------------
 use_fake()
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "reward_label": "Beta Tester"}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "reward_label": "Beta Tester"}))
 check("settings can be attached to a tagged code", r.status_code == 200, r.get_json())
 check("the label is stored", r.get_json()["entry"].get("reward_label") == "Beta Tester", r.get_json())
 check("the reward still comes from the tag",
       r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "reward_id": "LBAAD."}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "reward_id": "LBAAD."}))
 check("a settings reward_id cannot repoint a tagged code",
       r.get_json()["entry"].get("reward_id") == "LBAAC.", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "BRANDNEW", "reward_label": "x"}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BRANDNEW", "reward_label": "x"}))
 check("an unknown code with no currency is refused", r.status_code == 400, r.status_code)
 check("the refusal says how to make the code", "redeem:" in r.get_json().get("error", ""), r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "GOLD", "reward_id": "SR"}))
+r = app.post("/api/redeem-codes", json=admin({"code": "GOLD", "reward_id": "SR"}))
 check("a currency code without an amount is refused", r.status_code == 400, r.status_code)
 
-r = app.post("/api/redeem-codes", json=authed(
+r = app.post("/api/redeem-codes", json=admin(
     {"code": "GOLD", "reward_type": "currency", "reward_id": "SR", "amount": 250}))
 check("a currency code can be created", r.status_code == 200, r.get_json())
 check("the amount is stored", r.get_json()["entry"].get("amount") == 250, r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "note": "announcement"}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "note": "announcement"}))
 check("notes are stored", r.get_json()["entry"].get("note") == "announcement", r.get_json())
 
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "enabled": False}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "enabled": False}))
 check("a code can be disabled without touching PlayFab",
       r.get_json()["entry"].get("enabled") is False, r.get_json())
 check("a disabled code is refused in game",
       redeem({"code": "BETA", "playfab_id": "PF9"}).get_json().get("success") is False)
 
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "delete": True}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "delete": True}))
 check("settings can be deleted", r.status_code == 200, r.get_json())
-r = app.post("/api/redeem-codes", json=authed({"code": "BETA", "delete": True}))
+r = app.post("/api/redeem-codes", json=admin({"code": "BETA", "delete": True}))
 check("deleting already-absent settings 404s", r.status_code == 404, r.status_code)
 check("deleting settings leaves the catalog tag alone",
       mod.resolve_code("BETA") is not None)
@@ -837,7 +845,7 @@ check("upsert rejects a bad secret", r.status_code == 401, r.status_code)
 
 # --- listing --------------------------------------------------------------
 check("list rejects a missing secret", app.get("/api/redeem-codes").status_code == 401)
-r = app.get("/api/redeem-codes", headers={"X-Api-Secret": SECRET})
+r = app.get("/api/redeem-codes", headers={"X-Api-Secret": ADMIN})
 listed = r.get_json()
 check("list returns the codes", listed.get("success") is True, listed)
 check("list includes catalog-tagged codes", "BETA" in listed.get("codes", {}), listed)
@@ -888,7 +896,7 @@ check("the log has a timestamp", bool(rows[0].get("at")), rows[0])
 
 r = app.get("/api/redeem-log")
 check("the redeem log rejects a missing secret", r.status_code == 401)
-r = app.get("/api/redeem-log", headers={"X-Api-Secret": SECRET})
+r = app.get("/api/redeem-log", headers={"X-Api-Secret": ADMIN})
 check("the redeem log is readable", r.get_json().get("success") is True, r.get_json())
 check("the log endpoint reports the entry count",
       r.get_json().get("count", 0) >= 2, r.get_json())
@@ -912,7 +920,7 @@ mod.REDEEM_LOG_MAX_ENTRIES = 25
 
 # --- limits ---------------------------------------------------------------
 mod.REDEEM_CODES_MAX_BYTES = 10
-r = app.post("/api/redeem-codes", json=authed(
+r = app.post("/api/redeem-codes", json=admin(
     {"code": "BIG", "reward_type": "currency", "reward_id": "S" * 500, "amount": 1}))
 check("an oversized settings table is refused", r.status_code == 502, r.status_code)
 mod.REDEEM_CODES_MAX_BYTES = 3800
@@ -938,6 +946,136 @@ mod._redeem_cooldowns.clear()
 drop_cache()
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+print("\n--- security: credentials are never baked in ---")
+src = open(os.path.join(HERE, "api", "index.py"), encoding="utf-8").read()
+check("no Discord webhook URL committed in source", "discord.com/api/webhooks/" not in src)
+check("no PlayFab secret fallback in source",
+      'os.environ.get("PLAYFAB_SECRET_KEY", "")' in src)
+check("health lists missing env names",
+      "PLAYFAB_SECRET_KEY" in (app.get("/api/health").get_json().get("missing_env") or []))
+check("health never echoes secret values",
+      SECRET not in app.get("/api/health").get_data(as_text=True))
+
+print("\n--- security: admin endpoints refuse the client app key ---")
+for method, path in (("GET", "/api/dashboard"), ("GET", "/api/redeem-codes"),
+                     ("GET", "/api/redeem-log"), ("GET", "/api/tracker/tracked")):
+    r = app.get(path, headers={"X-Api-Secret": SECRET})
+    check("app key rejected on " + path, r.status_code == 401, r.status_code)
+r = app.post("/api/redeem-codes", json=authed({"code": "HACK", "reward_id": "SR", "amount": 999999}))
+check("app key cannot create redeem codes", r.status_code == 401, r.status_code)
+r = app.post("/api/tracker/refresh", json=authed({}))
+check("app key cannot refresh rosters", r.status_code == 401, r.status_code)
+
+_saved_admin = mod.ADMIN_SECRET
+mod.ADMIN_SECRET = ""
+r = app.get("/api/dashboard", headers={"X-Api-Secret": ""})
+check("unset ADMIN_SECRET closes the dashboard", r.status_code == 401, r.status_code)
+mod.ADMIN_SECRET = _saved_admin
+
+
+class _FakeIdentity(object):
+    """PlayFab stand-in: two real logins, one banned player, and a record of
+    every insta-ban CloudScript call."""
+
+    def __init__(self):
+        self.tickets = {"TICKET-MOD": "AAAAAAAAAAAA0001", "TICKET-ALICE": "AAAAAAAAAAAA0002"}
+        self.bans = {"BBBBBBBBBBBB0003": [{
+            "Active": True, "Reason": "[InstaBan] test",
+            "Expires": "2099-01-01T00:00:00.000Z"}]}
+        self.cloudscript_calls = []
+        self.up = True
+
+    def __call__(self, path, body):
+        if not self.up:
+            return False, {"errorMessage": "PlayFab unreachable"}
+        if path == "AuthenticateSessionTicket":
+            pid = self.tickets.get(body.get("SessionTicket"))
+            if not pid:
+                return False, {"errorMessage": "InvalidSessionTicket"}
+            return True, {"data": {"UserInfo": {"PlayFabId": pid},
+                                   "IsSessionTicketExpired": False}}
+        if path == "GetUserBans":
+            return True, {"data": {"BanData": self.bans.get(body["PlayFabId"], [])}}
+        if path == "ExecuteCloudScript":
+            self.cloudscript_calls.append(body)
+            return True, {"data": {"FunctionResult": {"banned": False, "reason": "reporter_not_authorized"}}}
+        return False, {"errorMessage": "unexpected " + path}
+
+
+fake_id = _FakeIdentity()
+mod.pf_request = fake_id
+_saved_title, _saved_key = mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY
+mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY = "TEST01", "test-key"
+mod._report_cooldowns.clear()
+
+print("\n--- security: reporter identity comes from the session ticket ---")
+check("valid ticket resolves", mod.authenticate_ticket("TICKET-MOD") == "AAAAAAAAAAAA0001")
+check("unknown ticket fails closed", mod.authenticate_ticket("FORGED") is None)
+check("empty ticket fails closed", mod.authenticate_ticket("") is None)
+
+r = app.post("/api/report", json=authed({
+    "reason": "Cheating", "reported_name": "Victim", "reported_id": "CCCCCCCCCCCC0004",
+    "reporter_name": "Attacker", "reporter_id": "AAAAAAAAAAAA0001"}))
+d = r.get_json()
+check("forged reporter_id still delivers the report", r.status_code == 200, r.status_code)
+check("forged reporter_id is marked unverified", d.get("reporter_verified") is False, d)
+check("forged reporter_id never reaches the insta-ban", fake_id.cloudscript_calls == [],
+      fake_id.cloudscript_calls)
+
+r = app.post("/api/report", json=authed({
+    "reason": "Cheating", "reported_name": "Victim", "reported_id": "CCCCCCCCCCCC0005",
+    "reporter_name": "Mod", "reporter_id": "SOMEONEELSE00000", "session_ticket": "TICKET-MOD"}))
+d = r.get_json()
+check("ticketed report is verified", d.get("reporter_verified") is True, d)
+check("insta-ban uses the ticket's PlayFab ID, not the body's",
+      fake_id.cloudscript_calls and fake_id.cloudscript_calls[-1]["PlayFabId"] == "AAAAAAAAAAAA0001"
+      and fake_id.cloudscript_calls[-1]["FunctionParameter"]["reporterPlayFabId"] == "AAAAAAAAAAAA0001",
+      fake_id.cloudscript_calls)
+
+r = app.post("/api/report", json=authed({
+    "reason": "Cheating", "reported_name": "Me", "reported_id": "AAAAAAAAAAAA0002",
+    "session_ticket": "TICKET-ALICE"}))
+check("cannot report yourself", r.status_code == 400, r.status_code)
+
+print("\n--- security: ban-status ---")
+r = app.post("/api/ban-status", json=authed({"playfab_id": "BBBBBBBBBBBB0003"}))
+check("ban-status requires a session", r.status_code == 401, r.status_code)
+r = app.post("/api/ban-status", json={"session_ticket": "TICKET-ALICE"})
+check("ban-status requires the app key", r.status_code == 401, r.status_code)
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-ALICE",
+                                              "playfab_id": "BBBBBBBBBBBB0003"}))
+d = r.get_json()
+check("banned player reported banned", d.get("banned") is True, d)
+check("ban carries hours", d.get("hours", 0) > 0, d)
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD",
+                                              "playfab_id": "CCCCCCCCCCCC0004"}))
+check("innocent player not banned", r.get_json().get("banned") is False, r.get_json())
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD"}))
+check("defaults to the caller", r.get_json().get("playfab_id") == "AAAAAAAAAAAA0001", r.get_json())
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD",
+                                              "playfab_id": "not hex!"}))
+check("bad target id 400", r.status_code == 400, r.status_code)
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD"}))
+check("ban-status is rate limited", r.status_code == 429, r.status_code)
+mod._ban_status_cooldowns.clear()
+fake_id.up = False
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD"}))
+check("PlayFab down never reports 'not banned' as success", r.status_code == 401, r.status_code)
+fake_id.up = True
+mod._ban_status_cooldowns.clear()
+_orig_active = mod.active_ban
+mod.active_ban = lambda pid: {"error": "boom"}
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD"}))
+check("ban lookup failure is a 502, not 'not banned'", r.status_code == 502, r.status_code)
+mod.active_ban = _orig_active
+
+mod.pf_request = _real_pf
+mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY = _saved_title, _saved_key
+mod._report_cooldowns.clear()
+mod._ban_status_cooldowns.clear()
+
 # ---------------------------------------------------------------------------
 print("\n--- result ---")
 print("  passed: {0}   failed: {1}".format(passed, failed))

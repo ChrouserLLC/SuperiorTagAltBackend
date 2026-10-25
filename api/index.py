@@ -17,6 +17,8 @@ Run locally:  python api/index.py
 Deploy:       Vercel (see vercel.json + README.md)
 """
 
+import calendar
+import hmac
 import json
 import os
 import re
@@ -33,20 +35,35 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "18175B")
-PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "AJM5UPP1CPMXZOWIE1X5MRCJ59HBYCO3P855ASPJJ8KCFW65M5")
+# Every credential comes from the environment ONLY. There are deliberately no
+# fallback values: a default committed to this file is a credential published to
+# everyone who can read the repository (the PlayFab secret key in particular
+# grants full server-side control of the title). Unset means "disabled".
+PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "")
+PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "")
 
-# One shared secret for every client-facing endpoint. The original services each
-# had their own (REPORT_SECRET / TRACKER_SECRET); a single value means the Unity
-# side is configured once.
+# Client "app key". It ships inside the APK, so it is NOT authentication - it
+# only filters out casual noise. Anything with real consequences (insta-ban,
+# kick verification) is authorised from the caller's PlayFab session ticket,
+# which the backend validates with PlayFab itself.
+#
+# Because it is public by design, it keeps a built-in default matching the value
+# compiled into ReportSender.cs, so reports and redeem keep working on a deploy
+# that has not set it. Override it in Vercel if you change the client value.
 API_SECRET = os.environ.get("API_SECRET", "vqeQrzStXB1U7wpojlC8Yaewmsae6YAcs3nEXfHFUJt0co1176gPQddh4qAwdqDA")
 
-TRACKER_WEBHOOK_URL = os.environ.get("TRACKER_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351111045447710/Tcfm53ZBDwYT21O6J898iAgwfoLTyn-UjQ_Bme4evlGYb43ECXrlKVxb3yGGpR4LRTwy")
-TRACKER_VIP_WEBHOOK_URL = os.environ.get("TRACKER_VIP_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351193568645151/7tv986Faqocmpfp0xu0m3_J4dxvYaMyKnwekz_0EljhNq0N-wz9315WRNiKFoMtegupa")
-REPORT_WEBHOOK_URL = os.environ.get("REPORT_WEBHOOK_URL", "https://discord.com/api/webhooks/1560351283498459297/Qa4Kc3XAvM8hia7xvtlxw5SG-xBzAuSaUzz055t17DePjIw-QkeWUfb767H1PMKOhYiL")
+# Operator-only secret for the dashboard and every endpoint that reads or
+# changes admin data (redeem codes, redeem log, rosters, player lists). It must
+# never be put in the game client. Unset means those endpoints are closed.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+
+TRACKER_WEBHOOK_URL = os.environ.get("TRACKER_WEBHOOK_URL", "")
+TRACKER_VIP_WEBHOOK_URL = os.environ.get("TRACKER_VIP_WEBHOOK_URL", "")
+REPORT_WEBHOOK_URL = os.environ.get("REPORT_WEBHOOK_URL", "")
 
 TRACKER_COOLDOWN_SECONDS = int(os.environ.get("TRACKER_COOLDOWN_SECONDS", "10"))
 REPORT_COOLDOWN_SECONDS = int(os.environ.get("REPORT_COOLDOWN_SECONDS", "15"))
+BAN_STATUS_COOLDOWN_SECONDS = int(os.environ.get("BAN_STATUS_COOLDOWN_SECONDS", "3"))
 
 TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 
@@ -74,7 +91,7 @@ REDEEM_CODES_KEY = os.environ.get("REDEEM_CODES_KEY", "RedeemCodes")
 # and eventually hit the TitleData size cap, silently losing redemption history.
 REDEEM_USED_KEY = os.environ.get("REDEEM_USED_KEY", "RedeemUsed")
 REDEEM_COOLDOWN_SECONDS = int(os.environ.get("REDEEM_COOLDOWN_SECONDS", "5"))
-REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "https://discord.com/api/webhooks/1560930877775679499/MWskoFRx4B6NPGvOC-kEw1pyZCtV6V-kP8lU5sMBxNOkRs6SrH88Cib9Ral1rLwsPPXF")
+REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "")
 
 try:
     ROLE_EMOJIS = json.loads(os.environ.get("TRACKER_ROLE_EMOJIS", "{}"))
@@ -176,6 +193,7 @@ _tracked_cache = None
 _tracked_cache_at = 0.0
 _tracker_cooldowns = {}
 _report_cooldowns = {}
+_ban_status_cooldowns = {}
 _redeem_cooldowns = {}
 _cooldown_lock = threading.Lock()
 _online_registry = {}
@@ -558,23 +576,102 @@ def online_snapshot():
 # Auth
 # ---------------------------------------------------------------------------
 
+def _secret_matches(candidate, expected):
+    """Constant-time comparison that never accepts an unset secret."""
+    if not expected or not candidate:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 def check_secret(body):
-    return (body.get("secret") or "").strip() == API_SECRET
+    """Client app key (see API_SECRET). Not authentication."""
+    return _secret_matches((body.get("secret") or "").strip(), API_SECRET)
 
 
-def check_secret_request():
-    """Auth for GET endpoints.
+def check_admin_request():
+    """Auth for operator endpoints (dashboard, redeem codes, rosters).
 
-    Accepts the secret either in the JSON body (the Unity client's convention)
-    or in an X-Api-Secret header. The header form exists so the browser
-    dashboard does not have to put the secret in a query string, where it would
-    end up in server logs and browser history.
+    Accepts ADMIN_SECRET in an X-Api-Secret header (what the dashboard sends,
+    so it never lands in a query string or server log) or as "secret" in the
+    JSON body. The client app key is NOT accepted here: it ships in the APK.
     """
     body = request.get_json(silent=True) or {}
-    candidate = (body.get("secret") or "").strip()
+    candidate = (request.headers.get("X-Api-Secret") or "").strip()
     if not candidate:
-        candidate = (request.headers.get("X-Api-Secret") or "").strip()
-    return bool(candidate) and candidate == API_SECRET
+        candidate = (body.get("secret") or "").strip()
+    return _secret_matches(candidate, ADMIN_SECRET)
+
+
+# Kept as an alias so older call sites read naturally; it is the ADMIN check.
+check_secret_request = check_admin_request
+
+
+# ---------------------------------------------------------------------------
+# Player identity (PlayFab session tickets)
+# ---------------------------------------------------------------------------
+
+_PLAYFAB_ID_RE = re.compile(r"^[0-9A-Fa-f]{12,32}$")
+
+
+def authenticate_ticket(session_ticket):
+    """Resolve a PlayFab session ticket to the PlayFab ID that owns it.
+
+    This is the only identity the backend trusts. A PlayFab ID typed into a
+    request body is just text - anyone can claim to be a moderator by sending
+    the moderator's ID - but a session ticket can only come from logging in as
+    that account. Returns the PlayFab ID, or None when the ticket is missing,
+    expired, forged or PlayFab cannot be reached (fail closed).
+    """
+    ticket = (session_ticket or "").strip()
+    if not ticket or len(ticket) > 4096:
+        return None
+    ok, result = pf_request("AuthenticateSessionTicket", {"SessionTicket": ticket})
+    if not ok:
+        return None
+    data = result.get("data") or {}
+    if data.get("IsSessionTicketExpired"):
+        return None
+    user = data.get("UserInfo") or {}
+    playfab_id = str(user.get("PlayFabId") or "").strip()
+    if not _PLAYFAB_ID_RE.match(playfab_id):
+        return None
+    return playfab_id
+
+
+def active_ban(playfab_id):
+    """Return the player's active ban as a dict, or None.
+
+    Asks PlayFab directly, so the answer cannot be spoofed by a game client.
+    Returns {"error": ...} when PlayFab cannot be asked, so callers can tell
+    "not banned" apart from "could not check".
+    """
+    if not playfab_id or not _PLAYFAB_ID_RE.match(playfab_id):
+        return None
+    ok, result = pf_request("GetUserBans", {"PlayFabId": playfab_id})
+    if not ok:
+        return {"error": result.get("errorMessage") or "ban lookup failed"}
+    now = time.time()
+    best = None
+    for ban in (result.get("data") or {}).get("BanData") or []:
+        if not ban.get("Active"):
+            continue
+        expires = ban.get("Expires")
+        remaining = None
+        if expires:
+            try:
+                ts = calendar.timegm(time.strptime(expires[:19], "%Y-%m-%dT%H:%M:%S"))
+                remaining = ts - now
+            except (ValueError, TypeError):
+                remaining = None
+            if remaining is not None and remaining <= 0:
+                continue
+        hours = 0 if remaining is None else max(1, int(round(remaining / 3600.0)))
+        entry = {"reason": ban.get("Reason") or "", "hours": hours,
+                 "permanent": remaining is None}
+        if best is None or entry["permanent"] or (
+                not best["permanent"] and entry["hours"] > best["hours"]):
+            best = entry
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +758,7 @@ def report():
     except (TypeError, ValueError):
         room_count = None
     reporter_name = (body.get("reporter_name") or "").strip()
-    reporter_id = (body.get("reporter_id") or "").strip()
+    claimed_reporter_id = (body.get("reporter_id") or "").strip()
     reported_name = (body.get("reported_name") or "").strip()
     reported_id = (body.get("reported_id") or "").strip()
 
@@ -670,6 +767,17 @@ def report():
     if not reported_name and not reported_id:
         return jsonify({"success": False,
                         "error": "reported_name or reported_id required"}), 400
+
+    # The reporter's identity comes from their session ticket, never from the
+    # body. Without a valid ticket the report is still delivered to Discord
+    # (marked unverified) so older builds keep working, but it can never
+    # trigger an insta-ban.
+    reporter_id = authenticate_ticket(body.get("session_ticket"))
+    reporter_verified = reporter_id is not None
+    if not reporter_verified:
+        reporter_id = claimed_reporter_id
+    if reporter_verified and reported_id == reporter_id:
+        return jsonify({"success": False, "error": "cannot report yourself"}), 400
 
     allowed, retry_after = hit_cooldown(
         _report_cooldowns,
@@ -685,13 +793,21 @@ def report():
 
     map_label = format_map(game_mode, scene, zone)
 
-    # Insta-ban first so the report embed can note the outcome.
-    instaban = run_instaban(reporter_id, reported_id, reason)
+    # Insta-ban first so the report embed can note the outcome. Only a
+    # PlayFab-verified reporter is ever passed on; the CloudScript then checks
+    # that verified ID against its allowlist.
+    if reporter_verified:
+        instaban = run_instaban(reporter_id, reported_id, reason)
+    else:
+        instaban = {"checked": False, "banned": False,
+                    "reason": "reporter not verified"}
     if instaban.get("banned"):
         post_webhook(REPORT_WEBHOOK_URL, build_ban_embed(instaban, body, reason))
 
+    shown_reporter_id = reporter_id if reporter_verified else (
+        (claimed_reporter_id + " (unverified)") if claimed_reporter_id else "(unverified)")
     payload = build_report_embed(reason, room_code, is_private, game_mode, scene,
-                                 map_label, reporter_name, reporter_id,
+                                 map_label, reporter_name, shown_reporter_id,
                                  reported_name, reported_id, room_count)
     sent, err = post_webhook(REPORT_WEBHOOK_URL, payload)
 
@@ -701,6 +817,7 @@ def report():
         "webhook_sent": sent,
         "webhook_error": err,
         "reporter": reporter_name,
+        "reporter_verified": reporter_verified,
         "reported": reported_name,
         "room_code": room_code,
         "is_private": is_private,
@@ -708,6 +825,47 @@ def report():
         "zone": zone,
         "map": map_label,
         "instaban": instaban,
+    })
+
+
+@app.route("/api/ban-status", methods=["POST"])
+def ban_status():
+    """Is this player actually banned? Asked by game clients before they act
+    on an in-room kick broadcast, so a forged broadcast cannot kick anyone.
+
+    The caller proves who they are with their own session ticket. They may ask
+    about themselves (to decide whether to leave) or, when they are the room's
+    master client, about another player (to decide whether to drop them).
+    """
+    body = request.get_json(silent=True) or {}
+    if not check_secret(body):
+        return jsonify({"success": False, "error": "bad secret"}), 401
+
+    caller = authenticate_ticket(body.get("session_ticket"))
+    if caller is None:
+        return jsonify({"success": False, "error": "invalid session"}), 401
+
+    target = (body.get("playfab_id") or "").strip() or caller
+    if not _PLAYFAB_ID_RE.match(target):
+        return jsonify({"success": False, "error": "invalid playfab_id"}), 400
+
+    allowed, retry_after = hit_cooldown(
+        _ban_status_cooldowns, "{0}|{1}".format(caller, target),
+        BAN_STATUS_COOLDOWN_SECONDS)
+    if not allowed:
+        return jsonify({"success": False, "error": "cooldown",
+                        "retry_after_seconds": retry_after}), 429
+
+    ban = active_ban(target)
+    if ban and ban.get("error"):
+        return jsonify({"success": False, "error": "lookup failed"}), 502
+    return jsonify({
+        "success": True,
+        "playfab_id": target,
+        "banned": bool(ban),
+        "hours": (ban or {}).get("hours", 0),
+        "permanent": bool((ban or {}).get("permanent")),
+        "reason": (ban or {}).get("reason", ""),
     })
 
 
@@ -1410,7 +1568,7 @@ def redeem_codes_upsert():
     settings, or declares a currency reward (which has no item to tag).
     """
     body = request.get_json(silent=True) or {}
-    if not check_secret(body):
+    if not check_admin_request():
         return jsonify({"success": False, "error": "bad secret"}), 401
 
     code = str(body.get("code") or "").strip().upper()
@@ -1619,7 +1777,7 @@ def tracked():
 @app.route("/api/tracker/refresh", methods=["POST"])
 def refresh():
     body = request.get_json(silent=True) or {}
-    if not check_secret(body):
+    if not check_admin_request():
         return jsonify({"success": False, "error": "bad secret"}), 401
     load_tracked_players(force=True)
     return jsonify({"success": True})
@@ -1629,13 +1787,21 @@ def refresh():
 # Meta / Info
 # ---------------------------------------------------------------------------
 
+REQUIRED_ENV = ("PLAYFAB_TITLE_ID", "PLAYFAB_SECRET_KEY", "ADMIN_SECRET",
+                "REPORT_WEBHOOK_URL", "REDEEM_WEBHOOK_URL",
+                "TRACKER_WEBHOOK_URL", "TRACKER_VIP_WEBHOOK_URL")
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
+        # Names only, never values: what still needs setting in Vercel.
+        "missing_env": [k for k in REQUIRED_ENV if not os.environ.get(k)],
         "service": "SuperiorTagAlt",
         "playfab_configured": bool(PLAYFAB_TITLE_ID and PLAYFAB_SECRET_KEY),
-        "api_secret_set": API_SECRET != "CHANGE_ME",
+        "api_secret_set": bool(API_SECRET),
+        "admin_secret_set": bool(ADMIN_SECRET),
         "tracker_webhook_set": bool(TRACKER_WEBHOOK_URL),
         "vip_webhook_set": bool(TRACKER_VIP_WEBHOOK_URL),
         "report_webhook_set": bool(REPORT_WEBHOOK_URL),
@@ -1654,7 +1820,7 @@ def home():
         "service": "SuperiorTagAlt",
         "features": ["tracker", "reports", "instaban", "redeem", "dashboard"],
         "endpoints": [
-            "/api/report", "/api/tracker", "/api/redeem",
+            "/api/report", "/api/ban-status", "/api/tracker", "/api/redeem",
             "/api/redeem-codes",
             "/api/online-count",
             "/api/online", "/api/dashboard", "/api/tracker/tracked",
