@@ -254,6 +254,18 @@ r = interact(btn2).get_json()
 check("report button is deferred as an update", r == {"type": 6} and len(fired) == 1, r)
 os.environ["DISCORD_DEFER"] = "0"
 
+print("\n--- gateway relay ---")
+relay = {"type": 2, "id": "rel1", "token": "t", "data": {"name": "rooms", "options": []},
+         "member": {"roles": ["1"], "user": {"id": "7", "username": "kid"}}}
+check("relay needs the admin secret", app.post("/api/discord/relay", json=relay).status_code == 401)
+r = app.post("/api/discord/relay", json=relay, headers={"X-Relay-Key": "test-admin-456"})
+check("relay runs the command", r.status_code == 200 and r.get_json()["type"] == 4, r.get_data())
+r = app.post("/api/discord/relay", json=relay, headers={"X-Relay-Key": "test-admin-456"})
+check("relay runs each interaction once", "Already" in r.get_json()["data"]["content"], r.get_json())
+r = app.get("/api/discord/relay/presence", headers={"X-Relay-Key": "test-admin-456"})
+check("presence endpoint answers", r.status_code == 200 and "count" in r.get_json(), r.get_data())
+check("presence needs the secret", app.get("/api/discord/relay/presence").status_code == 401)
+
 print("\n--- command definitions ---")
 defs = bot.command_definitions()
 check("every command is defined", sorted(c["name"] for c in defs) ==

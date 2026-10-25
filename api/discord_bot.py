@@ -47,6 +47,7 @@ DISCORD_API = "https://discord.com/api/v10"
 # Interaction / response types (Discord API).
 PING, APP_COMMAND, COMPONENT = 1, 2, 3
 R_PONG, R_MESSAGE, R_UPDATE = 1, 4, 7
+R_DEFER_MESSAGE, R_DEFER_UPDATE = 5, 6
 EPHEMERAL = 64
 
 def ACCENT():
@@ -118,20 +119,21 @@ def verify_signature(raw_body, signature_hex, timestamp):
 # Discord REST
 # ---------------------------------------------------------------------------
 
-def discord_api(method, path, body=None, timeout=5):
-    """Calls the Discord REST API as the bot. Returns (ok, json_or_none)."""
+def discord_api(method, path, body=None, timeout=5, auth=True):
+    """Calls the Discord REST API as the bot. Returns (ok, json_or_none).
+    auth=False is for interaction webhooks, which are authorised by their token."""
     token = env("DISCORD_BOT_TOKEN")
-    if not token:
+    if auth and not token:
         return False, {"message": "DISCORD_BOT_TOKEN is not set"}
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        DISCORD_API + path, data=data, method=method,
-        headers={
-            "Authorization": "Bot " + token,
-            "Content-Type": "application/json",
-            # Discord rejects requests without a bot-style User-Agent.
-            "User-Agent": "DiscordBot (https://github.com/ChrouserLLC/SuperiorTagAltBackend, 1.0)",
-        })
+    headers = {
+        "Content-Type": "application/json",
+        # Discord rejects requests without a bot-style User-Agent.
+        "User-Agent": "DiscordBot (https://github.com/ChrouserLLC/SuperiorTagAltBackend, 1.0)",
+    }
+    if auth:
+        headers["Authorization"] = "Bot " + token
+    req = urllib.request.Request(DISCORD_API + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -980,6 +982,82 @@ def handle_component(deps, payload):
 STAFF_COMMANDS = {"player", "ban", "unban", "code", "live", "verifybadge"}
 
 
+READ_ONLY_COMMANDS = {"players", "status", "rooms", "player"}
+INLINE_BUDGET_SECONDS = 1.3
+
+
+def defer_enabled():
+    return env("DISCORD_DEFER", "1") != "0"
+
+
+def _run_with_budget(func, seconds):
+    """Returns func()'s result if it finishes in time, else None."""
+    box = {}
+
+    def run():
+        try:
+            box["r"] = func()
+        except Exception as e:  # pragma: no cover - defensive
+            box["e"] = e
+
+    from flask import copy_current_request_context
+    t = threading.Thread(target=copy_current_request_context(run), daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive() or "e" in box:
+        return None
+    return box.get("r")
+
+
+def worker_url():
+    base = env("DISCORD_WORKER_BASE_URL") or ("https://" + request.host)
+    return base.rstrip("/") + "/api/discord/work"
+
+
+def _start_worker(raw, sig, ts):
+    """Hands the interaction to /api/discord/work (a separate invocation with no
+    3-second limit). Only waits long enough for the request to go out."""
+    req = urllib.request.Request(worker_url(), data=raw, method="POST", headers={
+        "Content-Type": "application/json",
+        "X-Signature-Ed25519": sig,
+        "X-Signature-Timestamp": ts,
+    })
+    try:
+        urllib.request.urlopen(req, timeout=0.8).close()
+    except Exception:
+        pass  # a read timeout is expected: the worker is still busy
+
+
+def _response_json(resp):
+    try:
+        return json.loads(resp.get_data(as_text=True))
+    except Exception:
+        return None
+
+
+def finish_deferred(deps, payload):
+    """Runs the interaction and puts the result where Discord shows it."""
+    app_id = env("DISCORD_APP_ID") or str(payload.get("application_id") or "")
+    token = payload.get("token")
+    if not app_id or not token:
+        return False
+    try:
+        out = _response_json(dispatch(deps, payload)) or {}
+    except Exception:
+        out = {"type": R_MESSAGE, "data": {"embeds": [{"description": "Something went wrong.", "color": RED}],
+                                            "flags": EPHEMERAL}}
+    data = dict(out.get("data") or {})
+    hook = "/webhooks/{0}/{1}".format(app_id, token)
+    if payload.get("type") == COMPONENT and out.get("type") != R_UPDATE:
+        # A button that failed: keep the report as it is, tell only the presser.
+        data["flags"] = EPHEMERAL
+        ok, _ = discord_api("POST", hook, data, timeout=8, auth=False)
+        return ok
+    data.pop("flags", None)
+    ok, _ = discord_api("PATCH", hook + "/messages/@original", data, timeout=8, auth=False)
+    return ok
+
+
 def register(app, deps):
     @app.route("/api/discord/interactions", methods=["GET"])
     def discord_interactions_check():
@@ -998,8 +1076,9 @@ def register(app, deps):
     @app.route("/api/discord/interactions", methods=["POST"])
     def discord_interactions():
         raw = request.get_data(cache=True)
-        if not verify_signature(raw, request.headers.get("X-Signature-Ed25519", ""),
-                                request.headers.get("X-Signature-Timestamp", "")):
+        sig = request.headers.get("X-Signature-Ed25519", "")
+        ts = request.headers.get("X-Signature-Timestamp", "")
+        if not verify_signature(raw, sig, ts):
             return "invalid request signature", 401
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -1009,36 +1088,77 @@ def register(app, deps):
         kind = payload.get("type")
         if kind == PING:
             return jsonify({"type": R_PONG})
-        if kind == COMPONENT:
-            return handle_component(deps, payload)
-        if kind != APP_COMMAND:
-            return error_message("Unsupported interaction.")
+        if not defer_enabled() or kind not in (APP_COMMAND, COMPONENT):
+            return dispatch(deps, payload)
 
-        data = payload.get("data") or {}
-        name = data.get("name")
-        sub, opts = options_of(data)
-        if name in STAFF_COMMANDS and not is_staff(payload):
+        name = (payload.get("data") or {}).get("name")
+        if kind == APP_COMMAND and name in STAFF_COMMANDS and not is_staff(payload):
             return error_message("That command is for staff.")
+        if kind == COMPONENT and not is_staff(payload):
+            return error_message("Only staff can use these buttons.")
 
-        if name == "players":
-            return cmd_players(deps, payload, opts)
-        if name == "status":
-            return cmd_status(deps, payload, opts)
-        if name == "rooms":
-            return cmd_rooms(deps, payload, opts)
-        if name == "player":
-            return cmd_player(deps, payload, opts)
-        if name == "ban":
-            return cmd_ban(deps, payload, opts)
-        if name == "unban":
-            return cmd_unban(deps, payload, opts)
-        if name == "verifybadge":
-            return cmd_verifybadge(deps, payload, opts)
-        if name == "code":
-            return cmd_code(deps, payload, sub, opts)
-        if name == "live":
-            return cmd_live(deps, payload, sub, opts)
-        return error_message("Unknown command.")
+        # Discord gives us 3 seconds. Read-only commands get a short head start
+        # here; anything that changes data (bans, codes, buttons) goes straight
+        # to the worker so it can never run twice.
+        if kind == APP_COMMAND and name in READ_ONLY_COMMANDS:
+            result = _run_with_budget(lambda: dispatch(deps, payload), INLINE_BUDGET_SECONDS)
+            if result is not None:
+                return result
+
+        _start_worker(raw, sig, ts)
+        if kind == COMPONENT:
+            return jsonify({"type": R_DEFER_UPDATE})
+        deferred = {"type": R_DEFER_MESSAGE}
+        if name in STAFF_COMMANDS:
+            deferred["data"] = {"flags": EPHEMERAL}
+        return jsonify(deferred)
+
+    @app.route("/api/discord/work", methods=["POST"])
+    def discord_work():
+        # Second half of a deferred interaction: same signed body Discord sent us,
+        # re-checked here, run once, then the reply is edited in via the webhook.
+        raw = request.get_data(cache=True)
+        ts = request.headers.get("X-Signature-Timestamp", "")
+        if not verify_signature(raw, request.headers.get("X-Signature-Ed25519", ""), ts):
+            return "invalid request signature", 401
+        try:
+            if abs(time.time() - int(ts)) > 600:
+                return "stale", 401
+            payload = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return "bad request", 400
+        if not deps.acquire_lock("dwork:" + str(payload.get("id") or ts), 900):
+            return jsonify({"ok": True, "duplicate": True})
+        finish_deferred(deps, payload)
+        return jsonify({"ok": True})
+
+    # -- Gateway relay ------------------------------------------------------
+    # bot/gateway_bot.py keeps the bot Online and forwards each interaction
+    # here. Authorised with ADMIN_SECRET instead of Discord's signature.
+    def _relay_ok():
+        secret = env("ADMIN_SECRET")
+        given = request.headers.get("X-Relay-Key", "")
+        import hmac
+        return bool(secret) and hmac.compare_digest(given.encode("utf-8"), str(secret).encode("utf-8"))
+
+    @app.route("/api/discord/relay", methods=["POST"])
+    def discord_relay():
+        if not _relay_ok():
+            return jsonify({"error": "unauthorized"}), 401
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "bad json"}), 400
+        if not deps.acquire_lock("drelay:" + str(payload.get("id") or ""), 900):
+            return jsonify({"type": R_MESSAGE, "data": {"content": "Already handled.", "flags": EPHEMERAL}})
+        return dispatch(deps, payload)
+
+    @app.route("/api/discord/relay/presence", methods=["GET"])
+    def discord_relay_presence():
+        if not _relay_ok():
+            return jsonify({"error": "unauthorized"}), 401
+        now = current_count(deps) or {}
+        fresh = now and time.time() - now.get("ts", 0) < 300
+        return jsonify({"count": int(now.get("count", 0)) if fresh else None, "game": game_name()})
 
     @app.route("/api/players/chart.png", methods=["GET"])
     def players_chart():
@@ -1046,6 +1166,42 @@ def register(app, deps):
         p = peak(pts)
         png = render_chart(pts, game_name(), p[1] if p else None)
         return Response(png, mimetype="image/png", headers={"Cache-Control": "public, max-age=60"})
+
+
+def dispatch(deps, payload):
+    """Runs one command/button and returns the Flask response Discord would get."""
+    kind = payload.get("type")
+    if kind == COMPONENT:
+        return handle_component(deps, payload)
+    if kind != APP_COMMAND:
+        return error_message("Unsupported interaction.")
+
+    data = payload.get("data") or {}
+    name = data.get("name")
+    sub, opts = options_of(data)
+    if name in STAFF_COMMANDS and not is_staff(payload):
+        return error_message("That command is for staff.")
+
+    if name == "players":
+        return cmd_players(deps, payload, opts)
+    if name == "status":
+        return cmd_status(deps, payload, opts)
+    if name == "rooms":
+        return cmd_rooms(deps, payload, opts)
+    if name == "player":
+        return cmd_player(deps, payload, opts)
+    if name == "ban":
+        return cmd_ban(deps, payload, opts)
+    if name == "unban":
+        return cmd_unban(deps, payload, opts)
+    if name == "verifybadge":
+        return cmd_verifybadge(deps, payload, opts)
+    if name == "code":
+        return cmd_code(deps, payload, sub, opts)
+    if name == "live":
+        return cmd_live(deps, payload, sub, opts)
+    return error_message("Unknown command.")
+
 
 
 # ---------------------------------------------------------------------------
