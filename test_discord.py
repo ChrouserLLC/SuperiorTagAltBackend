@@ -22,6 +22,7 @@ os.environ["DISCORD_PUBLIC_KEY"] = KEY.public_key().public_bytes(
     serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
 os.environ["DISCORD_STAFF_ROLE_IDS"] = "999"
 os.environ["PUBLIC_BASE_URL"] = "https://backend.example"
+os.environ["DISCORD_DEFER"] = "0"  # most tests check the reply directly
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("alt_backend_d", os.path.join(HERE, "api", "index.py"))
@@ -210,6 +211,48 @@ check("buttons only for real PlayFab ids", bot.report_buttons("not an id") == []
 sent = []
 ok, err = bot.post_report({"embeds": [{}]}, "AAAAAAAAAAAA0001", lambda p: (sent.append(p) or (True, None)))
 check("without a bot channel, reports still go to the webhook", ok and sent, sent)
+
+print("\n--- deferred replies (3-second limit) ---")
+os.environ["DISCORD_DEFER"] = "1"
+os.environ["DISCORD_APP_ID"] = "555"
+fired, hooks = [], []
+bot._start_worker = lambda raw, sig, ts: fired.append((raw, sig, ts))
+bot.discord_api = lambda method, path, body=None, timeout=5, auth=True: (hooks.append((method, path, body, auth)) or (True, {}))
+r = interact(command("rooms")).get_json()
+check("fast read-only command still answers inline", r["type"] == 4 and not fired, r)
+slow_status = bot.cmd_status
+bot.cmd_status = lambda deps, payload, opts: (time.sleep(2.0), bot.message(content="late"))[1]
+r = interact(command("status")).get_json()
+check("slow read-only command is deferred", r == {"type": 5} and len(fired) == 1, r)
+bot.cmd_status = slow_status
+fired.clear()
+ban_cmd = command("ban", [{"name": "player", "value": "BBBBBBBBBBBB0002"}, {"name": "hours", "value": 1},
+                          {"name": "reason", "value": "x"}], staff=True)
+ban_cmd.update({"id": "int1", "token": "tok1"})
+bans_before = len(fake.bans)
+r = interact(ban_cmd).get_json()
+check("/ban is deferred (ephemeral) and does not ban inline",
+      r == {"type": 5, "data": {"flags": 64}} and len(fake.bans) == bans_before and len(fired) == 1, r)
+raw, sig, ts = fired[-1]
+w = app.post("/api/discord/work", data=raw, headers={"X-Signature-Ed25519": sig, "X-Signature-Timestamp": ts},
+             content_type="application/json")
+check("worker runs the ban once", w.status_code == 200 and len(fake.bans) == bans_before + 1, w.get_data())
+check("worker edits the original reply without the bot token",
+      hooks and hooks[-1][0] == "PATCH" and hooks[-1][1] == "/webhooks/555/tok1/messages/@original"
+      and hooks[-1][3] is False and "flags" not in hooks[-1][2], hooks[-1:])
+w2 = app.post("/api/discord/work", data=raw, headers={"X-Signature-Ed25519": sig, "X-Signature-Timestamp": ts},
+              content_type="application/json")
+check("replayed work is ignored", len(fake.bans) == bans_before + 1 and w2.get_json().get("duplicate"), w2.get_json())
+check("unsigned work refused", app.post("/api/discord/work", data=raw, content_type="application/json").status_code == 401)
+r = interact(command("ban", staff=False)).get_json()
+check("non-staff /ban refused immediately", r["type"] == 4 and "staff" in r["data"]["embeds"][0]["description"].lower())
+btn2 = {"type": 3, "id": "int2", "token": "tok2", "data": {"custom_id": "rdis:BBBBBBBBBBBB0002"},
+        "member": {"roles": ["999"], "user": {"id": "42", "username": "mod"}},
+        "message": {"embeds": [{"title": "Report"}]}}
+fired.clear()
+r = interact(btn2).get_json()
+check("report button is deferred as an update", r == {"type": 6} and len(fired) == 1, r)
+os.environ["DISCORD_DEFER"] = "0"
 
 print("\n--- command definitions ---")
 defs = bot.command_definitions()
