@@ -324,8 +324,32 @@ def id_for_name(deps, name):
 _FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
 
+# Pixelify Sans (https://fonts.google.com/specimen/Pixelify+Sans) is used when
+# its .ttf is in api/fonts; otherwise the bundled DejaVu Sans Mono.
+_PIXEL_FILES = {
+    True: ["PixelifySans-Bold.ttf", "PixelifySans-SemiBold.ttf"],
+    False: ["PixelifySans-Medium.ttf", "PixelifySans-Regular.ttf"],
+}
+_PIXEL_VARIABLE = ["PixelifySans-VariableFont_wght.ttf", "PixelifySans[wght].ttf"]
+
+
 def _font(size, bold=False):
     from PIL import ImageFont
+    for name in _PIXEL_FILES[bold]:
+        try:
+            return ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
+        except (OSError, IOError):
+            pass
+    for name in _PIXEL_VARIABLE:
+        try:
+            f = ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
+            try:
+                f.set_variation_by_name("Bold" if bold else "Medium")
+            except Exception:
+                pass
+            return f
+        except (OSError, IOError):
+            pass
     name = "DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"
     try:
         return ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
@@ -1157,8 +1181,17 @@ def register(app, deps):
         if not _relay_ok():
             return jsonify({"error": "unauthorized"}), 401
         now = current_count(deps) or {}
-        fresh = now and time.time() - now.get("ts", 0) < 300
-        return jsonify({"count": int(now.get("count", 0)) if fresh else None, "game": game_name()})
+        fresh = bool(now) and time.time() - now.get("ts", 0) < 300
+        rooms = public_rooms(deps) if fresh else []
+        p = peak(history(deps, 61)) if fresh else None
+        modes = {}
+        for r in rooms:
+            if r.get("mode"):
+                label = deps.format_game_mode(r["mode"])
+                modes[label] = modes.get(label, 0) + int(r.get("players") or 0)
+        top_mode = max(modes, key=modes.get) if modes else None
+        return jsonify({"count": int(now.get("count", 0)) if fresh else None, "game": game_name(),
+                        "rooms": len(rooms), "peak": p[1] if p else None, "top_mode": top_mode})
 
     @app.route("/api/players/chart.png", methods=["GET"])
     def players_chart():

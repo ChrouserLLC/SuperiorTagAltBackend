@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 import aiohttp
 import discord
@@ -30,7 +31,8 @@ PRIVATE_VALUES = os.path.join(HERE, "..", "private", "vercel-env-values.txt")
 API = "https://discord.com/api/v10"
 STAFF_COMMANDS = {"player", "ban", "unban", "code", "live", "verifybadge"}
 INLINE_SECONDS = 2.2          # Discord allows 3s for the first reply
-PRESENCE_EVERY = 60
+PRESENCE_EVERY = 60          # refresh numbers from the backend
+ROTATE_EVERY = 15            # switch to the next status
 
 
 def _looks_real(v):
@@ -86,29 +88,62 @@ class Bot(discord.Client):
         print("[bot] online as {0} - relaying to {1}".format(self.user, BACKEND))
 
     # -- presence ---------------------------------------------------------
+    async def fetch_stats(self):
+        """Live numbers from the backend, or None if it can't be reached."""
+        try:
+            async with self.http_session.get(BACKEND + "/api/discord/relay/presence",
+                                             headers={"X-Relay-Key": RELAY_KEY},
+                                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return await r.json()
+                if r.status == 401:
+                    print("[bot] backend refused ADMIN_SECRET - check it matches Vercel")
+        except Exception as e:
+            print("[bot] stats check failed:", type(e).__name__)
+        return None
+
+    @staticmethod
+    def rotation(stats):
+        """(activity, status) pairs to cycle through, built from the live numbers."""
+        W, P, L, C = (discord.ActivityType.watching, discord.ActivityType.playing,
+                      discord.ActivityType.listening, discord.ActivityType.competing)
+        if stats is None:
+            # Backend down: red dot so staff notice.
+            return [(discord.CustomActivity(name="\u26a0\ufe0f Backend unreachable"), discord.Status.dnd),
+                    (discord.Activity(type=P, name="Superior Tag"), discord.Status.dnd)]
+        count, rooms = stats.get("count"), stats.get("rooms") or 0
+        if count is None:
+            # Up, but no game is reporting: yellow moon.
+            return [(discord.CustomActivity(name="\U0001f4a4 Waiting for monkes..."), discord.Status.idle),
+                    (discord.Activity(type=P, name="Superior Tag on Quest"), discord.Status.idle),
+                    (discord.Activity(type=L, name="/players \u2022 /status"), discord.Status.idle)]
+        on = discord.Status.online
+        items = [
+            (discord.CustomActivity(name="\U0001f98d {0} monke{1} online".format(count, "" if count == 1 else "s")), on),
+            (discord.Activity(type=W, name="{0} public room{1}".format(rooms, "" if rooms == 1 else "s")), on),
+            (discord.Activity(type=P, name="Superior Tag on Quest"), on),
+        ]
+        if stats.get("top_mode"):
+            items.append((discord.Activity(type=C, name=str(stats["top_mode"])), on))
+        if stats.get("peak"):
+            items.append((discord.CustomActivity(name="\U0001f4c8 Peak {0} this hour".format(stats["peak"])), on))
+        items.append((discord.Activity(type=L, name="/players \u2022 /rooms \u2022 /status"), on))
+        return items
+
     async def presence_loop(self):
         await self.wait_until_ready()
+        stats, fetched_at, i = None, 0.0, 0
         while not self.is_closed():
-            text = "Superior Tag"
+            if time.time() - fetched_at >= PRESENCE_EVERY:
+                stats, fetched_at = await self.fetch_stats(), time.time()
+            items = self.rotation(stats)
+            activity, status = items[i % len(items)]
+            i += 1
             try:
-                async with self.http_session.get(BACKEND + "/api/discord/relay/presence",
-                                                 headers={"X-Relay-Key": RELAY_KEY},
-                                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        if data.get("count") is not None:
-                            text = "{0} monkes".format(data["count"])
-                    elif r.status == 401:
-                        print("[bot] backend refused ADMIN_SECRET - check it matches Vercel")
-            except Exception as e:
-                print("[bot] presence check failed:", type(e).__name__)
-            try:
-                await self.change_presence(status=discord.Status.online,
-                                           activity=discord.Activity(type=discord.ActivityType.watching,
-                                                                     name=text))
+                await self.change_presence(status=status, activity=activity)
             except Exception:
                 pass
-            await asyncio.sleep(PRESENCE_EVERY)
+            await asyncio.sleep(ROTATE_EVERY)
 
     # -- interactions -----------------------------------------------------
     async def on_socket_raw_receive(self, msg):
