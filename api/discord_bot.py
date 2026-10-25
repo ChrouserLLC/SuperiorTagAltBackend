@@ -725,6 +725,30 @@ def cmd_ban(deps, payload, opts):
         "color": RED}], ephemeral=True)
 
 
+def cmd_verifybadge(deps, payload, opts):
+    """Gives or removes the blue checkmark (VerifiedBadgeManager.cs reads it).
+
+    Stored as the player's PUBLIC read-only data "Verified" = "true", so every
+    client can read it but only the server key can write it.
+    """
+    pid = resolve_player(deps, opts.get("player"))
+    if not pid:
+        return error_message("No player found for that name or ID.")
+    give = opts.get("verified")
+    give = True if give is None else bool(give)
+    if give:
+        body = {"PlayFabId": pid, "Data": {"Verified": "true"}, "Permission": "Public"}
+    else:
+        body = {"PlayFabId": pid, "KeysToRemove": ["Verified"]}
+    ok, result = deps.pf_request("UpdateUserReadOnlyData", body)
+    if not ok:
+        return error_message("PlayFab refused: {0}".format((result or {}).get("errorMessage") or "unknown error"))
+    return message(embeds=[{
+        "description": ("Gave `{0}` the verified checkmark." if give else "Removed the verified checkmark from `{0}`.")
+        .format(pid) + " It shows in game within a few minutes.",
+        "color": GREEN}], ephemeral=True)
+
+
 def cmd_unban(deps, payload, opts):
     pid = resolve_player(deps, opts.get("player"))
     if not pid:
@@ -942,7 +966,7 @@ def handle_component(deps, payload):
 # Wiring
 # ---------------------------------------------------------------------------
 
-STAFF_COMMANDS = {"player", "ban", "unban", "code", "live"}
+STAFF_COMMANDS = {"player", "ban", "unban", "code", "live", "verifybadge"}
 
 
 def register(app, deps):
@@ -983,6 +1007,8 @@ def register(app, deps):
             return cmd_ban(deps, payload, opts)
         if name == "unban":
             return cmd_unban(deps, payload, opts)
+        if name == "verifybadge":
+            return cmd_verifybadge(deps, payload, opts)
         if name == "code":
             return cmd_code(deps, payload, sub, opts)
         if name == "live":
@@ -1002,7 +1028,7 @@ def register(app, deps):
 # ---------------------------------------------------------------------------
 
 def command_definitions():
-    STR, INT, CHANNEL, SUB = 3, 4, 7, 1
+    STR, INT, BOOL, CHANNEL, SUB = 3, 4, 5, 7, 1
     staff = "0"  # hidden from everyone but admins by default; grant to your staff role in Server Settings
 
     def opt(name, desc, kind=STR, required=True, **extra):
@@ -1022,6 +1048,10 @@ def command_definitions():
                      opt("reason", "Why", STR)]},
         {"name": "unban", "description": "Lift every ban on a player (staff)", "default_member_permissions": staff,
          "options": [opt("player", "PlayFab ID or the in-game name")]},
+        {"name": "verifybadge", "description": "Give or remove the verified checkmark (staff)",
+         "default_member_permissions": staff,
+         "options": [opt("player", "PlayFab ID or the in-game name"),
+                     opt("verified", "true = give it, false = remove it (default true)", BOOL, required=False)]},
         {"name": "code", "description": "Manage redeem codes (staff)", "default_member_permissions": staff,
          "options": [
              {"type": SUB, "name": "list", "description": "List every code"},

@@ -161,6 +161,20 @@ check("/unban revokes bans", fake.revoked == ["BBBBBBBBBBBB0002"], fake.revoked)
 d = interact(command("player", [{"name": "player", "type": 3, "value": "nobody"}], staff=True)).get_json()
 check("/player with an unknown name explains itself", "No player found" in d["data"]["embeds"][0]["description"])
 
+print("\n--- /verifybadge ---")
+_pf = mod.pf_request
+writes = []
+mod.pf_request = lambda path, body: (writes.append((path, body)) or (True, {"data": {}})) if path == "UpdateUserReadOnlyData" else _pf(path, body)
+interact(command("verifybadge", [{"name": "player", "type": 3, "value": "BBBBBBBBBBBB0002"}], staff=True))
+check("/verifybadge sets public read-only Verified=true",
+      writes and writes[-1][1].get("Data") == {"Verified": "true"} and writes[-1][1].get("Permission") == "Public", writes)
+interact(command("verifybadge", [{"name": "player", "type": 3, "value": "BBBBBBBBBBBB0002"},
+                                 {"name": "verified", "type": 5, "value": False}], staff=True))
+check("/verifybadge false removes it", writes[-1][1].get("KeysToRemove") == ["Verified"], writes[-1])
+d = interact(command("verifybadge", [{"name": "player", "type": 3, "value": "BBBBBBBBBBBB0002"}])).get_json()
+check("/verifybadge is staff only", "staff" in d["data"]["embeds"][0]["description"].lower(), d)
+mod.pf_request = _pf
+
 print("\n--- /code ---")
 calls = []
 mod.upsert_code = lambda body: (calls.append(body) or ({"success": True, "code": body["code"],
@@ -200,7 +214,7 @@ check("without a bot channel, reports still go to the webhook", ok and sent, sen
 print("\n--- command definitions ---")
 defs = bot.command_definitions()
 check("every command is defined", sorted(c["name"] for c in defs) ==
-      sorted(["players", "status", "rooms", "player", "ban", "unban", "code", "live"]))
+      sorted(["players", "status", "rooms", "player", "ban", "unban", "code", "live", "verifybadge"]))
 check("staff commands are hidden by default",
       all(c.get("default_member_permissions") == "0" for c in defs if c["name"] in bot.STAFF_COMMANDS))
 

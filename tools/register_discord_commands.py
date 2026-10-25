@@ -2,10 +2,11 @@
 Registers the bot's slash commands with Discord. Run once, and again after
 changing a command's options:
 
-    set DISCORD_APP_ID=...
-    set DISCORD_BOT_TOKEN=...
-    set DISCORD_GUILD_ID=...      (your server: commands appear instantly)
     python tools/register_discord_commands.py
+
+It reads DISCORD_APP_ID and DISCORD_BOT_TOKEN from private/vercel-env-values.txt
+(or real environment variables) and asks for your server ID, so commands appear
+in your server instantly.
 
 Without DISCORD_GUILD_ID the commands are registered globally, which can take
 up to an hour to show up.
@@ -22,12 +23,47 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import discord_bot  # noqa: E402
 
 
+PRIVATE_VALUES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "private", "vercel-env-values.txt")
+
+
+def _looks_real(value):
+    return bool(value) and "..." not in value and " " not in value and not value.lower().startswith("your")
+
+
+def _from_private_file(name):
+    """Reads NAME=value from private/vercel-env-values.txt (kept out of git)."""
+    try:
+        with open(PRIVATE_VALUES, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _value(name, prompt=None):
+    value = os.environ.get(name, "").strip()
+    if not _looks_real(value):
+        value = _from_private_file(name)
+    if not _looks_real(value) and prompt:
+        value = input(prompt).strip()
+    return value if _looks_real(value) else ""
+
+
 def main():
-    app_id = os.environ.get("DISCORD_APP_ID", "").strip()
-    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-    guild = os.environ.get("DISCORD_GUILD_ID", "").strip()
+    app_id = _value("DISCORD_APP_ID")
+    token = _value("DISCORD_BOT_TOKEN")
+    guild = _value("DISCORD_GUILD_ID",
+                   "Your Discord server ID (right-click the server icon > Copy Server ID; "
+                   "blank = register globally): ")
     if not app_id or not token:
-        print("Set DISCORD_APP_ID and DISCORD_BOT_TOKEN first.")
+        print("Couldn't find DISCORD_APP_ID / DISCORD_BOT_TOKEN. Put them in private/vercel-env-values.txt "
+              "or set them as real values (not '...').")
+        return 1
+    if guild and not guild.isdigit():
+        print("That server ID doesn't look right - it should be only digits.")
         return 1
 
     path = ("/applications/{0}/guilds/{1}/commands".format(app_id, guild) if guild
