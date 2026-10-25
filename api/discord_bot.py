@@ -89,9 +89,20 @@ def game_name():
 # Signature check
 # ---------------------------------------------------------------------------
 
+def clean_public_key():
+    """The portal's Public Key, tolerating stray spaces/quotes pasted into Vercel."""
+    return (env("DISCORD_PUBLIC_KEY") or "").strip().strip('"').strip("'").strip()
+
+
+def public_key_status():
+    key = clean_public_key()
+    valid = len(key) == 64 and all(c in "0123456789abcdefABCDEF" for c in key)
+    return {"public_key_set": bool(key), "public_key_valid": valid, "public_key_length": len(key)}
+
+
 def verify_signature(raw_body, signature_hex, timestamp):
     """Discord signs every interaction with Ed25519. Anything unsigned is refused."""
-    public_key = env("DISCORD_PUBLIC_KEY")
+    public_key = clean_public_key()
     if not public_key or not signature_hex or not timestamp:
         return False
     try:
@@ -970,6 +981,20 @@ STAFF_COMMANDS = {"player", "ban", "unban", "code", "live", "verifybadge"}
 
 
 def register(app, deps):
+    @app.route("/api/discord/interactions", methods=["GET"])
+    def discord_interactions_check():
+        # Open this in a browser to check the deploy has the bot and a usable key.
+        # Only reports whether the (public) key looks right - never its value.
+        status = public_key_status()
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey  # noqa: F401
+            status["crypto_ok"] = True
+        except Exception as exc:  # pragma: no cover - deploy problem
+            status["crypto_ok"] = False
+            status["crypto_error"] = type(exc).__name__
+        status["ok"] = status["public_key_valid"] and status["crypto_ok"]
+        return jsonify(status)
+
     @app.route("/api/discord/interactions", methods=["POST"])
     def discord_interactions():
         raw = request.get_data(cache=True)
