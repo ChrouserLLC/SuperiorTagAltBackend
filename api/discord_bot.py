@@ -323,41 +323,85 @@ def id_for_name(deps, name):
 
 _FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
+# Pixelify Sans (https://fonts.google.com/specimen/Pixelify+Sans, SIL OFL).
+# A copy in api/fonts is used first; otherwise the variable font is downloaded
+# once from the Google Fonts repo and cached in the temp folder. DejaVu Sans
+# Mono is only a last resort if both fail.
+_PIXEL_LOCAL = [
+    "PixelifySans-VariableFont_wght.ttf",
+    "PixelifySans[wght].ttf",
+    "PixelifySans-Regular.ttf",
+]
+_PIXEL_URL_DEFAULT = ("https://github.com/google/fonts/raw/main/ofl/pixelifysans/"
+                      "PixelifySans%5Bwght%5D.ttf")
+_pixel_state = {"path": None, "failed_at": 0.0}
+_font_cache = {}
 
-# Pixelify Sans (https://fonts.google.com/specimen/Pixelify+Sans) is used when
-# its .ttf is in api/fonts; otherwise the bundled DejaVu Sans Mono.
-_PIXEL_FILES = {
-    True: ["PixelifySans-Bold.ttf", "PixelifySans-SemiBold.ttf"],
-    False: ["PixelifySans-Medium.ttf", "PixelifySans-Regular.ttf"],
-}
-_PIXEL_VARIABLE = ["PixelifySans-VariableFont_wght.ttf", "PixelifySans[wght].ttf"]
+
+def _pixelify_path():
+    if _pixel_state["path"] and os.path.exists(_pixel_state["path"]):
+        return _pixel_state["path"]
+    for name in _PIXEL_LOCAL:
+        path = os.path.join(_FONT_DIR, name)
+        if os.path.exists(path):
+            _pixel_state["path"] = path
+            return path
+    import tempfile
+    cached = os.path.join(tempfile.gettempdir(), "PixelifySans-wght.ttf")
+    if os.path.exists(cached) and os.path.getsize(cached) > 10000:
+        _pixel_state["path"] = cached
+        return cached
+    if time.time() - _pixel_state["failed_at"] < 300:
+        return None
+    try:
+        req = urllib.request.Request(env("PIXEL_FONT_URL", _PIXEL_URL_DEFAULT),
+                                     headers={"User-Agent": "SuperiorTagBackend/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = resp.read()
+        if len(data) < 10000 or data[:4] not in (b"\x00\x01\x00\x00", b"true", b"OTTO"):
+            raise ValueError("download is not a font file")
+        tmp = cached + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, cached)
+        _pixel_state["path"] = cached
+        return cached
+    except Exception as exc:
+        _pixel_state["failed_at"] = time.time()
+        print("[chart] Pixelify Sans download failed, using fallback font: {0}".format(exc))
+        return None
 
 
-def _font(size, bold=False):
+def _font(size, weight=500):
+    key = (size, weight)
+    if key in _font_cache:
+        return _font_cache[key]
     from PIL import ImageFont
-    for name in _PIXEL_FILES[bold]:
+    f = None
+    path = _pixelify_path()
+    if path:
         try:
-            return ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
+            f = ImageFont.truetype(path, size)
+            try:
+                f.set_variation_by_axes([weight])
+            except Exception:
+                try:
+                    f.set_variation_by_name("Bold" if weight >= 650 else "Medium")
+                except Exception:
+                    pass
         except (OSError, IOError):
-            pass
-    for name in _PIXEL_VARIABLE:
+            f = None
+    if f is None:
+        name = "DejaVuSansMono-Bold.ttf" if weight >= 650 else "DejaVuSansMono.ttf"
         try:
             f = ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
-            try:
-                f.set_variation_by_name("Bold" if bold else "Medium")
-            except Exception:
-                pass
-            return f
         except (OSError, IOError):
-            pass
-    name = "DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"
-    try:
-        return ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
-    except (OSError, IOError):
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:
-            return ImageFont.load_default()
+            try:
+                f = ImageFont.load_default(size=size)
+            except TypeError:
+                f = ImageFont.load_default()
+    _font_cache[key] = f
+    return f
 
 
 def _hex(value):
@@ -365,72 +409,133 @@ def _hex(value):
     return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def _mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def trend(points):
+    """(change, first, now) over the window, or None without two readings."""
+    vals = [v for _, v in points if v is not None]
+    if len(vals) < 2:
+        return None
+    return vals[-1] - vals[0], vals[0], vals[-1]
+
+
+def trend_text(points):
+    t = trend(points)
+    if t is None:
+        return "-"
+    change = t[0]
+    if change > 0:
+        return "▲ +{0}".format(change)
+    if change < 0:
+        return "▼ {0}".format(change)
+    return "▬ 0"
+
+
 def render_chart(points, title, peak_value):
-    """Player-count chart in the style of the reference: dark card, accent top
-    rule, monospace labels, gradient area, a white dot on the peak and an
-    accent dot on the current value. Returns PNG bytes."""
+    """Pixel-art player chart: drawn at 1x with no anti-aliasing in Pixelify
+    Sans, a stepped line over a dithered fill, an up/down trend arrow next to
+    the live count, then scaled up with nearest-neighbour so every pixel stays
+    sharp. Returns PNG bytes."""
     from io import BytesIO
     from PIL import Image, ImageDraw
 
-    S = 2  # draw at 2x and downscale for smooth lines
-    W, H = 640 * S, 300 * S
-    left, right, top, bottom = 58 * S, 22 * S, 78 * S, 40 * S
+    K = 3
+    W, H = 320, 172
+    left, right, top, bottom = 30, 14, 56, 24
 
-    bg = (30, 31, 34)
-    card = (37, 38, 43)
-    grid = (58, 60, 67)
-    text = (232, 232, 236)
-    muted = (150, 152, 160)
+    bg = (14, 12, 22)
+    panel = (26, 23, 40)
+    grid = (54, 49, 78)
+    text = (242, 240, 252)
+    muted = (138, 132, 170)
     accent = _hex(env("DISCORD_ACCENT", "#A855F7"))
+    up_c = (74, 222, 128)
+    down_c = (248, 113, 113)
+    dim = _mix(panel, accent, 0.45)
+    glow = _mix(panel, accent, 0.75)
 
     img = Image.new("RGB", (W, H), bg)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([6 * S, 6 * S, W - 6 * S, H - 6 * S], fill=card)
-    draw.rectangle([6 * S, 6 * S, W - 6 * S, 9 * S], fill=accent)
+    d = ImageDraw.Draw(img)
+    d.fontmode = "1"
 
-    f_title = _font(17 * S, bold=True)
-    f_now = _font(17 * S, bold=True)
-    f_small = _font(11 * S)
-    f_small_b = _font(11 * S, bold=True)
+    # Card with a 1px accent frame and notched pixel corners.
+    d.rectangle([2, 2, W - 3, H - 3], fill=panel)
+    d.line([(3, 1), (W - 4, 1)], fill=accent)
+    d.line([(3, H - 2), (W - 4, H - 2)], fill=accent)
+    d.line([(1, 3), (1, H - 4)], fill=accent)
+    d.line([(W - 2, 3), (W - 2, H - 4)], fill=accent)
+    d.point([(2, 2), (W - 3, 2), (2, H - 3), (W - 3, H - 3)], fill=accent)
+    d.rectangle([2, 2, W - 3, 4], fill=accent)
+
+    f_title = _font(16, 700)
+    f_big = _font(24, 700)
+    f_small = _font(10, 500)
+    f_small_b = _font(10, 700)
 
     values = [v for _, v in points if v is not None]
-    now_v = next((v for _, v in reversed(points) if v is not None), 0)
-    top_v = max(values + [1])
-    step = max(1, -(-top_v // 4))  # ceil
-    if step * 4 == top_v:
-        step += max(1, step // 3)  # headroom above the peak, like the reference
-    y_max = step * 4
+    now_v = values[-1] if values else 0
 
-    draw.text((left, 22 * S), title.upper() + " PLAYERS", font=f_title, fill=text)
-    draw.text((left, 44 * S), "LAST HOUR", font=f_small, fill=muted)
-    now_label = "NOW {0}".format(now_v)
-    draw.text((W - right - draw.textlength(now_label, font=f_now), 22 * S), now_label, font=f_now, fill=accent)
-    peak_label = "PEAK {0}".format(peak_value if peak_value is not None else "-")
-    draw.text((W - right - draw.textlength(peak_label, font=f_small_b), 44 * S), peak_label,
-              font=f_small_b, fill=text)
+    # Header: game name and window on the left.
+    d.text((10, 10), title.upper(), font=f_title, fill=text)
+    d.text((10, 31), "PLAYERS ONLINE  /  LAST HOUR", font=f_small, fill=muted)
+
+    # Live count with the trend arrow on the right.
+    now_s = str(now_v)
+    nx = W - right - d.textlength(now_s, font=f_big)
+    d.text((nx, 4), now_s, font=f_big, fill=accent)
+    t = trend(points)
+    if t is None or t[0] == 0:
+        colour, label = muted, "SAME" if t is not None else "NOW"
+    elif t[0] > 0:
+        colour, label = up_c, "+{0}".format(t[0])
+    else:
+        colour, label = down_c, str(t[0])
+    lw = d.textlength(label, font=f_small_b)
+    lx = W - right - lw
+    ty = 33
+    d.text((lx, ty - 1), label, font=f_small_b, fill=colour)
+    ax = int(lx - 11)
+    if t is not None and t[0] > 0:
+        d.polygon([(ax, ty + 7), (ax + 8, ty + 7), (ax + 4, ty + 1)], fill=colour)
+    elif t is not None and t[0] < 0:
+        d.polygon([(ax, ty + 1), (ax + 8, ty + 1), (ax + 4, ty + 7)], fill=colour)
+    else:
+        d.rectangle([ax, ty + 3, ax + 7, ty + 5], fill=colour)
+
+    # Scale with a little headroom above the peak.
+    top_v = max(values + [1])
+    step = max(1, -(-top_v // 4))
+    if step * 4 == top_v:
+        step += max(1, step // 3)
+    y_max = step * 4
 
     plot_w = W - left - right
     plot_h = H - top - bottom
     base_y = top + plot_h
-
-    # Grid: dashed vertical lines every 10 minutes, horizontal lines per step.
     n = max(1, len(points) - 1)
+
+    # Dotted grid with labels.
     for i in range(5):
-        y = int(base_y - plot_h * i / 4)
-        draw.line([(left, y), (W - right, y)], fill=grid, width=S)
-        label = str(step * i)
-        draw.text((left - 10 * S - draw.textlength(label, font=f_small), y - 7 * S), label, font=f_small, fill=muted)
+        y = int(round(base_y - plot_h * i / 4.0))
+        d.point([(x, y) for x in range(left, W - right + 1, 3)], fill=grid)
+        lab = str(step * i)
+        d.text((left - 5 - d.textlength(lab, font=f_small), y - 6), lab, font=f_small, fill=muted)
+    last_x = -100
     for i, (m, _) in enumerate(points):
-        if i % 10 == 0 or i == len(points) - 1:
-            x = int(left + plot_w * i / n)
-            for y in range(top, base_y, 8 * S):
-                draw.line([(x, y), (x, min(y + 3 * S, base_y))], fill=grid, width=S)
-            label = time.strftime("%H:%M", time.gmtime(m * 60))
-            draw.text((x - draw.textlength(label, font=f_small) / 2, base_y + 10 * S), label,
-                      font=f_small, fill=muted)
+        x = int(round(left + plot_w * i / float(n)))
+        if (i % 15 == 0 or i == len(points) - 1) and x - last_x >= 40:
+            d.point([(x, y) for y in range(top, base_y, 3)], fill=grid)
+            lab = time.strftime("%H:%M", time.gmtime(m * 60))
+            lx2 = min(max(x - d.textlength(lab, font=f_small) / 2, left - 8), W - 6 - d.textlength(lab, font=f_small))
+            d.text((lx2, base_y + 6), lab, font=f_small, fill=muted)
+            last_x = x
+    d.line([(left, base_y), (W - right, base_y)], fill=muted)
 
     def xy(i, v):
-        return (left + plot_w * i / n, base_y - plot_h * (v / float(y_max)))
+        return (int(round(left + plot_w * i / float(n))),
+                int(round(base_y - plot_h * (v / float(y_max)))))
 
     runs, run = [], []
     for i, (_, v) in enumerate(points):
@@ -443,48 +548,49 @@ def render_chart(points, title, peak_value):
     if run:
         runs.append(run)
 
-    # Gradient area fill: accent at the line, fading out towards the baseline.
-    fill_layer = Image.new("RGB", (W, H), accent)
-    mask = Image.new("L", (W, H), 0)
-    mdraw = ImageDraw.Draw(mask)
     for r in runs:
-        if len(r) > 1:
-            mdraw.polygon([(r[0][0], base_y)] + r + [(r[-1][0], base_y)], fill=255)
-    fade = Image.new("L", (1, H), 0)
-    for y in range(H):
-        if y < top:
-            a = 0
-        else:
-            a = int(120 - 105 * (y - top) / float(max(1, plot_h)))
-        fade.putpixel((0, y), max(0, a))
-    fade = fade.resize((W, H))
-    from PIL import ImageChops
-    mask = ImageChops.multiply(mask, fade)
-    img.paste(fill_layer, (0, 0), mask)
+        if len(r) == 1:
+            r = [r[0], (r[0][0] + 2, r[0][1])]
+        stairs = [r[0]]
+        cols = {}
+        for (x0, y0), (x1, y1) in zip(r, r[1:]):
+            for x in range(x0, x1 + 1):
+                cols[x] = y0 if x < x1 else min(y0, y1)
+            stairs += [(x1, y0), (x1, y1)]
+        # Dithered fill: solid band under the line, checkerboard below it.
+        pts_glow, pts_dim = [], []
+        for x, y in cols.items():
+            for yy in range(y + 1, base_y):
+                if yy - y <= 3:
+                    pts_glow.append((x, yy))
+                elif (x + yy) % 2 == 0:
+                    pts_dim.append((x, yy))
+        d.point(pts_dim, fill=dim)
+        d.point(pts_glow, fill=glow)
+        d.line(stairs, fill=accent, width=2)
 
-    draw = ImageDraw.Draw(img)
-    for r in runs:
-        if len(r) > 1:
-            draw.line(r, fill=accent, width=2 * S + 1, joint="curve")
-
-    # White dot where the peak was first reached; accent dot on "now".
     if values:
         best = max(values)
         for i, (_, v) in enumerate(points):
             if v == best:
                 px, py = xy(i, v)
-                draw.ellipse([px - 4 * S, py - 4 * S, px + 4 * S, py + 4 * S], fill=(255, 255, 255))
+                d.polygon([(px, py - 4), (px + 4, py), (px, py + 4), (px - 4, py)], fill=text)
+                plab = "PEAK {0}".format(peak_value if peak_value is not None else best)
+                pw = d.textlength(plab, font=f_small_b)
+                plx = min(max(px - pw / 2, left), W - right - pw)
+                ply = py - 17 if py - 17 > top - 6 else py + 7
+                d.text((plx, ply), plab, font=f_small_b, fill=text)
                 break
         last_i = max(i for i, (_, v) in enumerate(points) if v is not None)
-        lx, ly = xy(last_i, points[last_i][1])
-        draw.ellipse([lx - 5 * S, ly - 5 * S, lx + 5 * S, ly + 5 * S], fill=(255, 255, 255))
-        draw.ellipse([lx - 3 * S, ly - 3 * S, lx + 3 * S, ly + 3 * S], fill=accent)
+        lx3, ly3 = xy(last_i, points[last_i][1])
+        d.rectangle([lx3 - 3, ly3 - 3, lx3 + 3, ly3 + 3], fill=text)
+        d.rectangle([lx3 - 2, ly3 - 2, lx3 + 2, ly3 + 2], fill=accent)
     else:
         msg = "NO DATA YET"
-        draw.text(((W - draw.textlength(msg, font=f_title)) / 2, top + plot_h / 2 - 10 * S), msg,
-                  font=f_title, fill=muted)
+        d.text(((W - d.textlength(msg, font=f_title)) / 2, top + plot_h / 2 - 10), msg,
+               font=f_title, fill=muted)
 
-    img = img.resize((W // S, H // S), Image.LANCZOS)
+    img = img.resize((W * K, H * K), Image.NEAREST)
     out = BytesIO()
     img.save(out, format="PNG", optimize=True)
     return out.getvalue()
@@ -521,6 +627,7 @@ def players_embed(deps):
             {"name": "Current", "value": "**{0}**".format(count), "inline": True},
             {"name": "Peak (1h)",
              "value": ("**{0}**\n<t:{1}:R>".format(p1[1], p1[0] * 60) if p1 else "-"), "inline": True},
+            {"name": "Trend (1h)", "value": "**{0}**".format(trend_text(pts_hour)), "inline": True},
         ],
         "image": {"url": "{0}/api/players/chart.png?v={1}".format(base_url(), _minute())},
     }
