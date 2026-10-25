@@ -1138,6 +1138,23 @@ check("staff reporting themselves still get their role", r.get_json().get("role"
 mod.lookup_role = _saved_lookup
 mod._tracker_cooldowns.clear()
 
+print("\n--- catalog export ---")
+r = app.get("/api/catalog", headers={"X-Api-Secret": SECRET})
+check("catalog export refuses the app key", r.status_code == 401, r.status_code)
+_saved_lc = mod.load_catalog
+mod.load_catalog = lambda force=False: [
+    {"ItemId": "LBAAC.", "DisplayName": "Crown", "ItemClass": "Hat", "VirtualCurrencyPrices": {"SR": 500, "RM": 1}},
+    {"ItemId": "LSAAA.", "DisplayName": "Set", "Bundle": {"BundledItems": ["LBAAC."]}, "VirtualCurrencyPrices": {"RM": 3}},
+    {"ItemId": "", "DisplayName": "broken"}]
+r = app.get("/api/catalog", headers={"X-Api-Secret": ADMIN})
+d = r.get_json()
+check("catalog export works for admins", r.status_code == 200 and d.get("count") == 2, d)
+check("catalog export prefers SR", d["items"][0]["price"] == 500 and d["items"][0]["currency"] == "SR", d)
+check("catalog export keeps bundles", d["items"][1]["bundle"] == ["LBAAC."], d)
+mod.load_catalog = lambda force=False: []
+check("catalog export 502 when PlayFab fails", app.get("/api/catalog", headers={"X-Api-Secret": ADMIN}).status_code == 502)
+mod.load_catalog = _saved_lc
+
 print("\n--- security: redeem ---")
 use_fake(settings={})
 mod.authenticate_ticket = lambda t: t[2:] if isinstance(t, str) and t.startswith("T:") and len(t) > 2 else None

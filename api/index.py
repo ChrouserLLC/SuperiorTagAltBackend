@@ -1893,6 +1893,46 @@ def upsert_code(body):
     return {"success": True, "code": code, "entry": entry}, 200
 
 
+@app.route("/api/catalog", methods=["GET"])
+def catalog_export():
+    """The PlayFab cosmetics catalog in a compact form, for the Unity editor's
+    Cosmetic Shop Tool ("Sync From PlayFab Catalog"). Admin secret required.
+
+    Shape is flat on purpose so Unity's JsonUtility can read it:
+      {"success": true, "items": [{"itemId", "displayName", "itemClass",
+        "price", "currency", "bundle": [...]}]}
+    price is -1 when the item has no price in the preferred currency.
+    """
+    if not check_admin_request():
+        return jsonify({"success": False, "error": "bad secret"}), 401
+    preferred = (request.args.get("currency") or "SR").strip().upper()[:4]
+    catalog = load_catalog(force=True)
+    if not catalog:
+        return jsonify({"success": False, "error": "catalog unavailable"}), 502
+    items = []
+    for it in catalog:
+        item_id = it.get("ItemId") or ""
+        if not item_id:
+            continue
+        prices = it.get("VirtualCurrencyPrices") or {}
+        if preferred in prices:
+            currency, price = preferred, prices[preferred]
+        elif prices:
+            currency, price = sorted(prices.items())[0]
+        else:
+            currency, price = "", -1
+        bundle = (it.get("Bundle") or {}).get("BundledItems") or []
+        items.append({
+            "itemId": item_id,
+            "displayName": it.get("DisplayName") or "",
+            "itemClass": it.get("ItemClass") or "",
+            "price": int(price) if isinstance(price, (int, float)) else -1,
+            "currency": currency,
+            "bundle": [str(b) for b in bundle],
+        })
+    return jsonify({"success": True, "count": len(items), "items": items})
+
+
 @app.route("/api/online-count", methods=["POST"])
 def online_count_report():
     global _online_global_count, _online_global_at
