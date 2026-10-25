@@ -2157,6 +2157,10 @@ class _Deps(object):
 _deps = _Deps()
 discord_bot.register(app, _deps)
 
+import staff_actions  # noqa: E402
+
+staff_actions.register(app, _deps)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
