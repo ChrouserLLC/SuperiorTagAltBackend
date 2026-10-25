@@ -332,13 +332,66 @@ These were bugs in the originals, fixed here:
 
 ---
 
+## Discord bot
+
+Slash commands answered by this backend (`api/discord_bot.py`), so nothing has
+to run all day. Discord POSTs each command to `/api/discord/interactions`.
+
+| Command | Who | What |
+|---|---|---|
+| `/players` | everyone | Current count, 1h and 24h peaks, and a chart of the last hour |
+| `/status` | everyone | PlayFab, attestation, SisterShip, data freshness, KV |
+| `/rooms` | everyone | Public rooms right now |
+| `/player <name or id>` | staff | Role, ban, created, last login, last seen in a room |
+| `/ban <player> <hours> <reason>` | staff | Ban through PlayFab; `0` hours = permanent |
+| `/unban <player>` | staff | Lift every ban |
+| `/code list / create / enable / disable / delete` | staff | Manage redeem codes |
+| `/live start <channel>` / `/live stop` | staff | A message that keeps updating with the player count |
+
+Reports get **Ban 24h / Ban 7d / Dismiss** buttons when `DISCORD_REPORT_CHANNEL_ID`
+is set (they are then posted by the bot instead of the webhook).
+
+The numbers come from the game: `PlayerCountReporter.cs` makes the Photon
+master client of every room post the count once a minute. History needs KV
+(Vercel > Storage > Upstash Redis); without it each serverless copy only sees
+the reports it received.
+
+### Setup (about 10 minutes)
+
+1. https://discord.com/developers/applications > **New Application**.
+2. **General Information**: copy the *Application ID* and *Public Key*.
+3. **Bot**: *Reset Token* and copy it.
+4. **Installation**: scopes `applications.commands` + `bot`, permissions
+   *Send Messages*, *Embed Links*. Open the install link and add it to your server.
+5. Vercel > this project > Environment Variables: `DISCORD_APP_ID`,
+   `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_STAFF_ROLE_IDS`, and
+   optionally `DISCORD_REPORT_CHANNEL_ID`. Redeploy.
+6. **General Information > Interactions Endpoint URL**:
+   `https://superiortagaltbackend.vercel.app/api/discord/interactions` > Save.
+   Discord tests it immediately; it only saves if the backend answers.
+7. Register the commands (from this folder):
+   ```powershell
+   $env:DISCORD_APP_ID="..."; $env:DISCORD_BOT_TOKEN="..."; $env:DISCORD_GUILD_ID="your server id"
+   python tools/register_discord_commands.py
+   ```
+8. Staff commands are hidden from everyone but admins at first. Server
+   Settings > Integrations > your bot: allow your staff role. The backend also
+   checks `DISCORD_STAFF_ROLE_IDS` itself, so hiding is only cosmetic.
+
+Bans apply the next time the player logs in; someone already in a room stays
+until they leave it.
+
 ## Tests
 
 ```
 python test_index.py
+python test_discord.py
 ```
 
-134 checks covering auth, input validation, cooldowns, the PlayFab degradation
+`test_discord.py` signs interactions with a throwaway key exactly like Discord
+and covers every command, the staff checks and the report buttons.
+
+`test_index.py`: 134 checks covering auth, input validation, cooldowns, the PlayFab degradation
 paths, map/game-mode/duration formatting, Discord embed shapes, the online
 registry, the dashboard endpoints, the player-ID privacy regressions and the two
 crash fixes above. Uses Flask's test client, so nothing leaves the machine and

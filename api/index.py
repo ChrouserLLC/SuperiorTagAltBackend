@@ -261,6 +261,26 @@ def pf_request(path, body):
         return False, {"errorMessage": "{0}: {1}".format(type(e).__name__, e)}
 
 
+def pf_admin_request(path, body):
+    """Same as pf_request, for the Admin API (e.g. look a player up by display name)."""
+    if not PLAYFAB_TITLE_ID or not PLAYFAB_SECRET_KEY:
+        return False, {"errorMessage": "PlayFab is not configured"}
+    url = "https://{0}.playfabapi.com/Admin/{1}".format(PLAYFAB_TITLE_ID, path)
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json", "X-SecretKey": PLAYFAB_SECRET_KEY})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, json.loads(e.read().decode("utf-8"))
+        except ValueError:
+            return False, {"errorMessage": "HTTP {0}".format(e.code)}
+    except Exception as e:
+        return False, {"errorMessage": "{0}: {1}".format(type(e).__name__, e)}
+
+
 def repair_tracked_players(raw):
     """Recover role lists from a malformed Title Data value."""
     result = {"content_creators": [], "moderators": [], "admins": [], "owners": []}
@@ -921,7 +941,10 @@ def report():
     payload = build_report_embed(reason, room_code, is_private, game_mode, scene,
                                  map_label, reporter_name, shown_reporter_id,
                                  reported_name, reported_id, room_count)
-    sent, err = post_webhook(REPORT_WEBHOOK_URL, payload)
+    # Through the Discord bot (with Ban/Dismiss buttons) when it is configured,
+    # otherwise the plain webhook as before.
+    sent, err = discord_bot.post_report(payload, reported_id,
+                                        lambda p: post_webhook(REPORT_WEBHOOK_URL, p))
 
     return jsonify({
         "success": sent,
@@ -1774,10 +1797,18 @@ def redeem_codes_upsert():
     body = request.get_json(silent=True) or {}
     if not check_admin_request():
         return jsonify({"success": False, "error": "bad secret"}), 401
+    payload, status = upsert_code(body)
+    return jsonify(payload), status
 
+
+def upsert_code(body):
+    """Create/update/delete a code's settings. Returns (payload, http_status).
+
+    Shared by the admin endpoint and the Discord bot's /code commands.
+    """
     code = str(body.get("code") or "").strip().upper()
     if not code:
-        return jsonify({"success": False, "error": "code required"}), 400
+        return {"success": False, "error": "code required"}, 400
 
     tagged, _ = load_redeem_index()
     settings = load_settings(force=True)
@@ -1785,18 +1816,18 @@ def redeem_codes_upsert():
 
     if body.get("delete"):
         if code not in settings:
-            return jsonify({
+            return {
                 "success": False,
                 "error": "no settings for that code (catalog tags are removed in PlayFab)",
-            }), 404
+            }, 404
         settings.pop(code, None)
         ok, result = save_settings(settings)
         if not ok:
-            return jsonify({
+            return {
                 "success": False,
                 "error": (result or {}).get("errorMessage") or "could not save",
-            }), 502
-        return jsonify({"success": True, "code": code})
+            }, 502
+        return {"success": True, "code": code}, 200
 
     merged = dict(settings.get(code) or {})
 
@@ -1818,48 +1849,48 @@ def redeem_codes_upsert():
         # No catalog item claims this code, so the table has to supply the whole
         # reward. Anything missing here is a bad request, not a broken code.
         if not reward_type:
-            return jsonify({
+            return {
                 "success": False,
                 "error": "unknown code - tag a catalog item '{0}{1}', "
                          "or send reward_type=currency with reward_id".format(
                              REDEEM_TAG_PREFIX, code),
-            }), 400
+            }, 400
         if reward_type == "currency":
             if not reward_id:
-                return jsonify({
+                return {
                     "success": False,
                     "error": "a currency code needs reward_id (e.g. SR or RM)",
-                }), 400
+                }, 400
             if not normalised.get("amount"):
-                return jsonify({
+                return {
                     "success": False,
                     "error": "a currency code needs a positive amount",
-                }), 400
+                }, 400
         else:
             # Validate the id now rather than letting the grant fail later with
             # a confusing PlayFab error. Worth doing because an amount-less
             # reward_id infers "cosmetic", so a typo'd currency code lands here.
             resolved = resolve_catalog_item_id(reward_id)
             if not resolved:
-                return jsonify({
+                return {
                     "success": False,
                     "error": "no catalog item matches '{0}' - if this is "
                              "currency, set reward_type=currency and an "
                              "amount".format(reward_id),
-                }), 400
+                }, 400
             # Store the catalog's own spelling so listings are unambiguous.
             normalised["reward_id"] = resolved
 
     settings[code] = normalised
     ok, result = save_settings(settings)
     if not ok:
-        return jsonify({
+        return {
             "success": False,
             "error": (result or {}).get("errorMessage") or "could not save",
-        }), 502
+        }, 502
 
     entry = resolve_code(code)
-    return jsonify({"success": True, "code": code, "entry": entry})
+    return {"success": True, "code": code, "entry": entry}, 200
 
 
 @app.route("/api/online-count", methods=["POST"])
@@ -1885,6 +1916,13 @@ def online_count_report():
     count = min(count, ONLINE_COUNT_MAX)
     _online_global_count = max(0, count)
     _online_global_at = time.time()
+    # History for the Discord /players chart, plus the reporter's room and its
+    # players (for /rooms and /player "last seen").
+    try:
+        discord_bot.record_report(_deps, reporter, _online_global_count,
+                                  room=body.get("room"), players=body.get("players"))
+    except Exception as e:
+        print("[online-count] record failed: {0}".format(type(e).__name__))
     return jsonify({"success": True, "online": _online_global_count})
 
 
@@ -2056,6 +2094,28 @@ def dashboard_page():
     with open(path, "r", encoding="utf-8") as handle:
         html = handle.read()
     return Response(html, mimetype="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Discord bot (api/discord_bot.py)
+# ---------------------------------------------------------------------------
+
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import discord_bot  # noqa: E402
+
+
+class _Deps(object):
+    """Hands the bot this module's helpers, looked up at call time so tests can
+    replace them (mod.pf_request = fake) after the bot is registered."""
+
+    def __getattr__(self, name):
+        return globals()[name]
+
+
+_deps = _Deps()
+discord_bot.register(app, _deps)
 
 
 if __name__ == "__main__":
