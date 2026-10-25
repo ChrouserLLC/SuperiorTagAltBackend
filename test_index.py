@@ -32,6 +32,11 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 app = mod.app.test_client()
 
+# Session tickets: tests use "T:<playfab id>". The real check (PlayFab
+# AuthenticateSessionTicket) is exercised in the security section below.
+_real_authenticate_ticket = mod.authenticate_ticket
+mod.authenticate_ticket = lambda t: t[2:] if isinstance(t, str) and t.startswith("T:") and len(t) > 2 else None
+
 SECRET = "test-secret-123"
 ADMIN = "test-admin-456"
 
@@ -199,7 +204,7 @@ r = app.post("/api/tracker", json=authed({"event": "joined_room"}))
 check("missing player identity 400", r.status_code == 400, r.status_code)
 
 base = {"event": "joined_room", "room": "ABC123", "player_name": "Alice",
-        "playfab_id": "PFALICE2", "player_count": 3, "max_players": 10,
+        "session_ticket": "T:PFALICE2", "player_count": 3, "max_players": 10,
         "game_mode": "INFECTION", "scene": "GorillaTagSJR", "region": "US",
         "platform": "Quest3", "players": ["Alice", "Bob", "Carol"]}
 
@@ -212,7 +217,14 @@ check("tracker webhook_sent false (unset)", d.get("webhook_sent") is False, d)
 check("tracker vip webhook not used", d.get("vip_webhook_sent") is False, d)
 
 r = app.post("/api/tracker", json=authed(dict(base, room="OTHER")))
-check("different room bypasses cooldown", r.status_code == 200, r.status_code)
+check("a different room does NOT bypass the cooldown", r.status_code == 429, r.status_code)
+mod._tracker_cooldowns.clear()
+
+r = app.post("/api/tracker", json=authed(dict(base, session_ticket="", playfab_id="PFOWNER")))
+d = r.get_json()
+check("a body playfab_id is ignored (no staff role without a ticket)", d.get("role") is None, d)
+mod._tracker_cooldowns.clear()
+r = app.post("/api/tracker", json=authed(dict(base, room="ABC123")))
 
 r = app.post("/api/tracker", json=authed(base))
 check("same event+player+room repeats -> 429", r.status_code == 429, r.status_code)
@@ -228,7 +240,7 @@ check("left_room accepted", r.status_code == 200, r.status_code)
 # ---------------------------------------------------------------------------
 print("\n--- tracker: malformed input must not 500 ---")
 r = app.post("/api/tracker", json=authed({
-    "event": "joined_room", "player_name": "Mal", "playfab_id": "PFMAL",
+    "event": "joined_room", "player_name": "Mal", "session_ticket": "T:PFMAL",
     "player_count": "lots", "max_players": None,
     "seconds_in_lobby": "ages", "players": "not-a-list",
 }))
@@ -402,6 +414,8 @@ check("query-string secret is not accepted", r.status_code == 401, r.status_code
 # ---------------------------------------------------------------------------
 print("\n--- online registry ---")
 r = app.post("/api/online-count", json=authed({"count": 42}))
+check("online-count needs a session", r.status_code == 401, r.status_code)
+r = app.post("/api/online-count", json=authed({"count": 42, "session_ticket": "T:OC1"}))
 check("online-count 200", r.status_code == 200, r.status_code)
 check("online-count echoes", r.get_json().get("online") == 42, r.get_json())
 
@@ -410,10 +424,16 @@ check("online returns 200", r.status_code == 200, r.status_code)
 check("online reads global count", r.get_json().get("online") == 42, r.get_json())
 check("online source is global_count", r.get_json().get("source") == "global_count", r.get_json())
 
-r = app.post("/api/online-count", json=authed({"count": "banana"}))
+r = app.post("/api/online-count", json=authed({"count": "banana", "session_ticket": "T:OC2"}))
 check("non-int count coerced to 0", r.get_json().get("online") == 0, r.get_json())
 
-r = app.post("/api/online-count", json=authed({"count": -5}))
+r = app.post("/api/online-count", json=authed({"count": -5, "session_ticket": "T:OC3"}))
+check("negative count still answers", r.status_code == 200, r.status_code)
+r = app.post("/api/online-count", json=authed({"count": 1, "session_ticket": "T:OC3"}))
+check("online-count is rate limited per player", r.status_code == 429, r.status_code)
+r = app.post("/api/online-count", json=authed({"count": 10 ** 9, "session_ticket": "T:OC4"}))
+check("online-count is capped", r.get_json().get("online") == mod.ONLINE_COUNT_MAX, r.get_json())
+r = app.post("/api/online-count", json=authed({"count": -5, "session_ticket": "T:OC5"}))
 check("negative count clamped to 0", r.get_json().get("online") == 0, r.get_json())
 
 # expire the global count so the registry fallback is exercised
@@ -514,9 +534,18 @@ print("\n--- redeem codes ---")
 
 # The redeem cooldown is per player+code and is 5s; tests fire back to back, so
 # clear it before each call rather than sleeping.
+def as_ticket(payload):
+    payload = dict(payload)
+    pid = payload.pop("playfab_id", None)
+    if pid:
+        payload["session_ticket"] = "T:" + pid
+    return payload
+
+
 def redeem(payload):
     mod._redeem_cooldowns.clear()
-    return app.post("/api/redeem", json=authed(payload))
+    mod._local_locks.clear()
+    return app.post("/api/redeem", json=authed(as_ticket(payload)))
 
 
 def drop_cache():
@@ -558,6 +587,7 @@ class _FakePlayFab(object):
         self.grant_ok = grant_ok
         self.grant_result_true = grant_result_true
         self.user_data = {}
+        self.readonly_data = {}
         self.grants = []
         self.currency_grants = []
         self.title_data = {"RedeemCodes": json.dumps(self.settings)}
@@ -578,6 +608,12 @@ class _FakePlayFab(object):
             return True, {}
         if path == "GetCatalogItems":
             return True, {"data": {"Catalog": self.catalog}}
+        if path == "GetUserReadOnlyData":
+            value = self.readonly_data.get(body["PlayFabId"])
+            return True, {"data": {"Data": {"RedeemUsed": {"Value": value}} if value else {}}}
+        if path == "UpdateUserReadOnlyData":
+            self.readonly_data[body["PlayFabId"]] = body["Data"]["RedeemUsed"]
+            return True, {}
         if path == "GetUserData":
             value = self.user_data.get(body["PlayFabId"])
             return True, {"data": {"Data": {"RedeemUsed": value} if value else {}}}
@@ -717,7 +753,7 @@ r = redeem({"code": "", "playfab_id": "PF1"})
 check("redeem rejects an empty code", r.status_code == 400, r.status_code)
 
 r = redeem({"code": "BETA", "playfab_id": ""})
-check("redeem rejects a missing playfab id", r.status_code == 400, r.status_code)
+check("redeem without a session is refused", r.status_code == 401, r.status_code)
 check("redeem tells the player to sign in",
       "SIGN IN" in (r.get_json().get("message") or ""), r.get_json())
 
@@ -855,8 +891,8 @@ check("list reports the tag prefix", listed.get("tag_prefix") == "redeem:", list
 # --- cooldown -------------------------------------------------------------
 co = use_fake()
 mod._redeem_cooldowns.clear()
-app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "PFC"}))
-r = app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "PFC"}))
+app.post("/api/redeem", json=authed(as_ticket({"code": "BETA", "playfab_id": "PFC"})))
+r = app.post("/api/redeem", json=authed(as_ticket({"code": "BETA", "playfab_id": "PFC"})))
 check("a repeat within the cooldown is refused", r.status_code == 429, r.status_code)
 check("the cooldown tells the player how long to wait",
       "SECONDS" in (r.get_json().get("message") or ""), r.get_json())
@@ -1006,6 +1042,7 @@ class _FakeIdentity(object):
 
 fake_id = _FakeIdentity()
 mod.pf_request = fake_id
+mod.authenticate_ticket = _real_authenticate_ticket
 _saved_title, _saved_key = mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY
 mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY = "TEST01", "test-key"
 mod._report_cooldowns.clear()
@@ -1048,7 +1085,13 @@ r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-ALICE",
                                               "playfab_id": "BBBBBBBBBBBB0003"}))
 d = r.get_json()
 check("banned player reported banned", d.get("banned") is True, d)
-check("ban carries hours", d.get("hours", 0) > 0, d)
+check("another player's ban reason and length are hidden",
+      d.get("reason") == "" and d.get("hours") == 0, d)
+fake_id.tickets["TICKET-BANNED"] = "BBBBBBBBBBBB0003"
+r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-BANNED"}))
+d = r.get_json()
+check("the banned player sees their own reason and hours",
+      d.get("banned") is True and d.get("hours", 0) > 0 and "InstaBan" in d.get("reason", ""), d)
 r = app.post("/api/ban-status", json=authed({"session_ticket": "TICKET-MOD",
                                               "playfab_id": "CCCCCCCCCCCC0004"}))
 check("innocent player not banned", r.get_json().get("banned") is False, r.get_json())
@@ -1076,6 +1119,109 @@ mod.PLAYFAB_TITLE_ID, mod.PLAYFAB_SECRET_KEY = _saved_title, _saved_key
 mod._report_cooldowns.clear()
 mod._ban_status_cooldowns.clear()
 
+
+print("\n--- security: tracker ---")
+mod.authenticate_ticket = lambda t: t[2:] if isinstance(t, str) and t.startswith("T:") and len(t) > 2 else None
+mod._tracker_cooldowns.clear()
+r = app.post("/api/tracker", json=authed({"event": "player_joined", "player_name": "Fake Owner",
+                                          "playfab_id": "PFOWNER"}))
+check("third-party events need a signed-in reporter", r.status_code == 401, r.status_code)
+_saved_lookup = mod.lookup_role
+mod.lookup_role = lambda pid: "owner" if pid == "PFOWNER" else None
+r = app.post("/api/tracker", json=authed({"event": "player_joined", "player_name": "Fake Owner",
+                                          "playfab_id": "PFOWNER", "session_ticket": "T:PFRANDOM"}))
+check("a claimed staff ID in a third-party event gets no role", r.get_json().get("role") is None, r.get_json())
+mod._tracker_cooldowns.clear()
+r = app.post("/api/tracker", json=authed({"event": "joined_room", "player_name": "Owner",
+                                          "session_ticket": "T:PFOWNER"}))
+check("staff reporting themselves still get their role", r.get_json().get("role") == "owner", r.get_json())
+mod.lookup_role = _saved_lookup
+mod._tracker_cooldowns.clear()
+
+print("\n--- security: redeem ---")
+use_fake(settings={})
+mod.authenticate_ticket = lambda t: t[2:] if isinstance(t, str) and t.startswith("T:") and len(t) > 2 else None
+fake = mod.pf_request
+r = redeem({"code": "BETA", "playfab_id": "VICTIM1"})
+check("first redeem works", r.get_json().get("success") is True, r.get_json())
+check("the spend is stored in READ-ONLY data", "VICTIM1" in fake.readonly_data, fake.readonly_data)
+check("nothing is written to player-editable data", "VICTIM1" not in fake.user_data, fake.user_data)
+# The player wipes their own (editable) UserData - must not matter.
+fake.user_data["VICTIM1"] = "[]"
+r = redeem({"code": "BETA", "playfab_id": "VICTIM1"})
+check("wiping player-editable data does not allow a second redeem",
+      r.get_json().get("success") is False, r.get_json())
+# Legacy record in editable data still counts as spent.
+fake.user_data["OLDPLAYER"] = json.dumps(["BETA"])
+r = redeem({"code": "BETA", "playfab_id": "OLDPLAYER"})
+check("a code spent under the old storage stays spent", r.get_json().get("success") is False, r.get_json())
+
+r = app.post("/api/redeem", json=authed({"code": "BETA", "playfab_id": "SOMEONEELSE"}))
+check("a body playfab_id alone cannot redeem", r.status_code == 401, r.status_code)
+
+# A read failure must refuse, not treat the player as having used nothing.
+_ok_fake = mod.pf_request
+mod.pf_request = lambda path, body: (False, {"errorMessage": "down"}) if path == "GetUserReadOnlyData" else _ok_fake(path, body)
+r = redeem({"code": "BETA", "playfab_id": "FRESH1"})
+check("unreadable spend record refuses the redeem", r.status_code == 502, r.status_code)
+mod.pf_request = _ok_fake
+
+# Concurrent redeem: the lock is held, a second one is refused.
+release = mod.acquire_lock("redeem:RACER", 30)
+mod._redeem_cooldowns.clear()
+r = app.post("/api/redeem", json=authed({"code": "BETA", "session_ticket": "T:RACER"}))
+check("a redeem while another is running for the same player is refused",
+      r.status_code == 429, r.status_code)
+release()
+check("the lock is free again after release", mod.acquire_lock("redeem:RACER", 30) is not None)
+mod._local_locks.clear()
+
+# Wrong guesses are capped per account.
+mod._attempt_counts.clear()
+codes = []
+for i in range(mod.REDEEM_MAX_WRONG_GUESSES + 1):
+    codes.append(redeem({"code": "GUESS{0}".format(i), "playfab_id": "GUESSER"}).get_json().get("message"))
+check("too many wrong codes are refused", "TOO MANY" in codes[-1], codes[-1])
+mod._attempt_counts.clear()
+
+# A failed grant gives the code back.
+use_fake(settings={}, grant_ok=False)
+fake = mod.pf_request
+redeem({"code": "BETA", "playfab_id": "UNLUCKY"})
+check("a failed grant restores the spend record",
+      json.loads(fake.readonly_data.get("UNLUCKY", "[]")) == [], fake.readonly_data)
+
+# KV-backed lock: SET NX semantics shared across copies.
+kv = {}
+def fake_kv(*args):
+    cmd = args[0]
+    if cmd == "SET":
+        key, val = args[1], args[2]
+        if "NX" in args and key in kv:
+            return True, None
+        kv[key] = val
+        return True, "OK"
+    if cmd == "GET":
+        return True, kv.get(args[1])
+    if cmd == "DEL":
+        return True, 1 if kv.pop(args[1], None) is not None else 0
+    if cmd == "INCR":
+        kv[args[1]] = int(kv.get(args[1], 0)) + 1
+        return True, kv[args[1]]
+    if cmd == "EXPIRE":
+        return True, 1
+    return False, None
+_saved_kv = (mod.kv_command, mod.kv_configured)
+mod.kv_command, mod.kv_configured = fake_kv, (lambda: True)
+a = mod.acquire_lock("redeem:KV1")
+b = mod.acquire_lock("redeem:KV1")
+check("KV lock: second taker is refused", a is not None and b is None)
+a()
+check("KV lock: free after release", mod.acquire_lock("redeem:KV1") is not None)
+mod.kv_command, mod.kv_configured = _saved_kv
+mod.authenticate_ticket = _real_authenticate_ticket
+mod.pf_request = _real_pf
+drop_cache()
 # ---------------------------------------------------------------------------
 print("\n--- result ---")
 print("  passed: {0}   failed: {1}".format(passed, failed))

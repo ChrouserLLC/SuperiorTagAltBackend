@@ -35,11 +35,12 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Every credential comes from the environment ONLY. There are deliberately no
+# Every secret comes from the environment ONLY. There are deliberately no
 # fallback values: a default committed to this file is a credential published to
 # everyone who can read the repository (the PlayFab secret key in particular
 # grants full server-side control of the title). Unset means "disabled".
-PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "")
+# The title ID is public (it ships in the game), so it keeps a default.
+PLAYFAB_TITLE_ID = os.environ.get("PLAYFAB_TITLE_ID", "18175B")
 PLAYFAB_SECRET_KEY = os.environ.get("PLAYFAB_SECRET_KEY", "")
 
 # Client "app key". It ships inside the APK, so it is NOT authentication - it
@@ -73,6 +74,8 @@ TRACKED_PLAYERS_KEY = os.environ.get("TRACKED_PLAYERS_KEY", "TrackedPlayers")
 # the list while everyone is still playing. The authoritative number is the
 # global count from /api/online-count; this list is best-effort detail.
 ONLINE_PLAYER_TTL_SECONDS = int(os.environ.get("ONLINE_PLAYER_TTL_SECONDS", "900"))
+# Upper bound for a reported global player count; anything above is clamped.
+ONLINE_COUNT_MAX = int(os.environ.get("ONLINE_COUNT_MAX", "5000"))
 
 # Redeem log: a rolling window of the most recent redemptions in TitleData so
 # there is something to look at after the fact. Capped, because a TitleData
@@ -91,6 +94,8 @@ REDEEM_CODES_KEY = os.environ.get("REDEEM_CODES_KEY", "RedeemCodes")
 # and eventually hit the TitleData size cap, silently losing redemption history.
 REDEEM_USED_KEY = os.environ.get("REDEEM_USED_KEY", "RedeemUsed")
 REDEEM_COOLDOWN_SECONDS = int(os.environ.get("REDEEM_COOLDOWN_SECONDS", "5"))
+REDEEM_MAX_WRONG_GUESSES = int(os.environ.get("REDEEM_MAX_WRONG_GUESSES", "10"))
+REDEEM_GUESS_WINDOW_SECONDS = int(os.environ.get("REDEEM_GUESS_WINDOW_SECONDS", "600"))
 REDEEM_WEBHOOK_URL = os.environ.get("REDEEM_WEBHOOK_URL", "")
 
 try:
@@ -104,6 +109,9 @@ ONLINE_GLOBAL_TTL_SECONDS = 90
 # ---------------------------------------------------------------------------
 # Static tables
 # ---------------------------------------------------------------------------
+
+# Events a client reports about ITSELF (identity = its session ticket).
+TRACKER_SELF_EVENTS = ("joined_room", "left_room")
 
 TRACKER_EVENT_LABELS = {
     "joined_room": "Joined Lobby",
@@ -194,6 +202,7 @@ _tracked_cache_at = 0.0
 _tracker_cooldowns = {}
 _report_cooldowns = {}
 _ban_status_cooldowns = {}
+_attempt_counts = {}
 _redeem_cooldowns = {}
 _cooldown_lock = threading.Lock()
 _online_registry = {}
@@ -607,10 +616,113 @@ check_secret_request = check_admin_request
 
 
 # ---------------------------------------------------------------------------
+# Shared store (Upstash / Vercel KV over REST)
+# ---------------------------------------------------------------------------
+#
+# Vercel runs several copies of this function at once and each has its own
+# memory, so an in-process lock or counter only covers requests that happen to
+# land on the same copy. Locks that must hold across ALL copies (one redeem per
+# player at a time) use KV when KV_REST_API_URL / KV_REST_API_TOKEN are set,
+# and fall back to an in-process lock otherwise (still correct on one copy).
+
+KV_REST_API_URL = os.environ.get("KV_REST_API_URL", "").rstrip("/")
+KV_REST_API_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
+
+
+def kv_configured():
+    return bool(KV_REST_API_URL and KV_REST_API_TOKEN)
+
+
+def kv_command(*args):
+    """Run one Redis command through the Upstash REST API.
+
+    Returns (ok, result). Never raises.
+    """
+    if not kv_configured():
+        return False, None
+    try:
+        req = urllib.request.Request(
+            KV_REST_API_URL,
+            data=json.dumps([str(a) for a in args]).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + KV_REST_API_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        if "error" in body:
+            return False, None
+        return True, body.get("result")
+    except Exception:
+        return False, None
+
+
+_local_locks = {}
+_local_locks_guard = threading.Lock()
+
+
+def acquire_lock(name, ttl_seconds=30):
+    """Take a named lock. Returns a release() callable, or None if it is held.
+
+    With KV the lock is shared by every serverless copy (SET NX with expiry, so
+    a crashed request cannot hold it forever). Without KV it is per-process.
+    If KV is configured but unreachable, the lock is refused (fail closed).
+    """
+    token = os.urandom(8).hex()
+    if kv_configured():
+        ok, result = kv_command("SET", "lock:" + name, token, "NX", "EX", int(ttl_seconds))
+        if not ok or result != "OK":
+            return None
+
+        def release():
+            ok2, current = kv_command("GET", "lock:" + name)
+            if ok2 and current == token:
+                kv_command("DEL", "lock:" + name)
+        return release
+
+    with _local_locks_guard:
+        now = time.time()
+        held_until = _local_locks.get(name, 0)
+        if held_until > now:
+            return None
+        _local_locks[name] = now + ttl_seconds
+
+    def release_local():
+        with _local_locks_guard:
+            _local_locks.pop(name, None)
+    return release_local
+
+
+def count_attempt(name, window_seconds, limit):
+    """Count an event in a fixed window. Returns True while under the limit."""
+    if kv_configured():
+        ok, value = kv_command("INCR", "count:" + name)
+        if not ok:
+            return False
+        if value == 1:
+            kv_command("EXPIRE", "count:" + name, int(window_seconds))
+        return int(value) <= limit
+    with _cooldown_lock:
+        now = time.time()
+        start, n = _attempt_counts.get(name, (now, 0))
+        if now - start > window_seconds:
+            start, n = now, 0
+        n += 1
+        _attempt_counts[name] = (start, n)
+        if len(_attempt_counts) > 5000:
+            for k in [k for k, (t, _) in _attempt_counts.items() if now - t > window_seconds]:
+                _attempt_counts.pop(k, None)
+        return n <= limit
+
+
+# ---------------------------------------------------------------------------
 # Player identity (PlayFab session tickets)
 # ---------------------------------------------------------------------------
 
-_PLAYFAB_ID_RE = re.compile(r"^[0-9A-Fa-f]{12,32}$")
+# Sanity check only: the ID itself always comes from PlayFab, never the client.
+_PLAYFAB_ID_RE = re.compile(r"^[0-9A-Za-z]{1,32}$")
 
 
 def authenticate_ticket(session_ticket):
@@ -859,13 +971,16 @@ def ban_status():
     ban = active_ban(target)
     if ban and ban.get("error"):
         return jsonify({"success": False, "error": "lookup failed"}), 502
+    # Only the player themselves learns WHY they are banned. Anyone else (the
+    # room host deciding whether to drop them) only needs yes/no.
+    is_self = target == caller
     return jsonify({
         "success": True,
         "playfab_id": target,
         "banned": bool(ban),
-        "hours": (ban or {}).get("hours", 0),
-        "permanent": bool((ban or {}).get("permanent")),
-        "reason": (ban or {}).get("reason", ""),
+        "hours": (ban or {}).get("hours", 0) if is_self else 0,
+        "permanent": bool((ban or {}).get("permanent")) if is_self else False,
+        "reason": (ban or {}).get("reason", "") if is_self else "",
     })
 
 
@@ -880,9 +995,31 @@ def tracker():
         return jsonify({"success": False, "error": "bad secret"}), 401
 
     event = (body.get("event") or "").strip()
-    room = (body.get("room") or "").strip()
-    player_name = (body.get("player_name") or "").strip()
-    playfab_id = (body.get("playfab_id") or "").strip()
+    room = (body.get("room") or "").strip()[:32]
+    player_name = (body.get("player_name") or "").strip()[:32]
+    # Who is posting comes from their session ticket. A playfab_id in the body
+    # is ignored: trusting it let anyone post "Owner joined" by sending a staff
+    # member's ID. Unverified events still count, but never get a staff role.
+    if not player_name and not body.get("session_ticket"):
+        return jsonify({"success": False,
+                        "error": "player_name or session_ticket required"}), 400
+    if event not in TRACKER_EVENT_LABELS:
+        return jsonify({"success": False, "error": "unknown event"}), 400
+    reporter_id = authenticate_ticket(body.get("session_ticket")) or ""
+    if event in TRACKER_SELF_EVENTS:
+        # The player is reporting themselves: their identity is the ticket.
+        playfab_id = reporter_id
+        if not playfab_id:
+            player_name = (player_name or "unknown") + " (unverified)"
+        subject_verified = bool(playfab_id)
+    else:
+        # Someone else joined/left. The subject's ID can only be claimed, so it
+        # never earns a staff role or a VIP ping (staff are announced by their
+        # own client's joined_room event, which is verified).
+        playfab_id = (body.get("playfab_id") or "").strip()[:32]
+        subject_verified = False
+        if not reporter_id:
+            return jsonify({"success": False, "error": "invalid session"}), 401
     game_mode = (body.get("game_mode") or "").strip()
     scene = (body.get("scene") or "").strip()
     region = (body.get("region") or "").strip()
@@ -908,18 +1045,20 @@ def tracker():
         return jsonify({"success": False,
                         "error": "player_name or playfab_id required"}), 400
 
-    role = lookup_role(playfab_id)
+    role = lookup_role(playfab_id) if (playfab_id and subject_verified) else None
 
-    online_key = playfab_id or player_name
-    if "left" in event:
-        untouch_online(online_key)
-    else:
-        touch_online(online_key, player_name)
+    # Only verified players are counted as online, so the list cannot be padded.
+    if playfab_id and subject_verified:
+        if "left" in event:
+            untouch_online(playfab_id)
+        else:
+            touch_online(playfab_id, player_name)
 
+    # Keyed per account (or per name when unverified), not per room, so
+    # cycling room names cannot be used to spam the channel.
     allowed, retry_after = hit_cooldown(
         _tracker_cooldowns,
-        "{0}|{1}|{2}".format(event, playfab_id or player_name or "unknown",
-                              room or ""),
+        "{0}|{1}|{2}".format(event, reporter_id or "-", playfab_id or player_name or "unknown"),
         TRACKER_COOLDOWN_SECONDS)
     if not allowed:
         return jsonify({
@@ -1253,17 +1392,10 @@ def list_codes():
 
 # --- redemption history ---------------------------------------------------
 
-def get_player_redeemed(playfab_id):
-    """Codes this player has already spent. Never raises."""
-    if not playfab_id:
-        return []
-    ok, result = pf_request("GetUserData", {
-        "PlayFabId": playfab_id,
-        "Keys": [REDEEM_USED_KEY],
-    })
-    if not ok:
-        return []
+def _parse_used(result):
     value = ((result.get("data") or {}).get("Data") or {}).get(REDEEM_USED_KEY)
+    if isinstance(value, dict):
+        value = value.get("Value")
     if not value:
         return []
     try:
@@ -1275,12 +1407,49 @@ def get_player_redeemed(playfab_id):
     return [str(v).strip().upper() for v in value]
 
 
+def get_player_redeemed(playfab_id):
+    """Codes this player has already spent, or None if PlayFab could not be read.
+
+    The record lives in the player's READ-ONLY data. Regular UserData can be
+    rewritten by the player's own game client (Client/UpdateUserData), which let
+    a modded client wipe the list and redeem the same code forever. Read-only
+    data can only be written with the server key.
+
+    Older redemptions were stored in regular UserData. Those are merged in, so a
+    code spent before this change still counts as spent (a player can only ADD
+    entries there, which only hurts themselves).
+
+    Returns None (not []) when the read fails, so the caller refuses instead of
+    treating "could not check" as "never used".
+    """
+    if not playfab_id:
+        return None
+    ok, result = pf_request("GetUserReadOnlyData", {
+        "PlayFabId": playfab_id,
+        "Keys": [REDEEM_USED_KEY],
+    })
+    if not ok:
+        return None
+    used = _parse_used(result)
+
+    ok_legacy, legacy = pf_request("GetUserData", {
+        "PlayFabId": playfab_id,
+        "Keys": [REDEEM_USED_KEY],
+    })
+    if ok_legacy:
+        legacy_used = _parse_used(legacy)
+        for code in set(legacy_used):
+            missing = legacy_used.count(code) - used.count(code)
+            used.extend([code] * max(0, missing))
+    return used
+
+
 def mark_player_redeemed(playfab_id, code, already_used):
     used = list(already_used)
     # Append unconditionally: a code with max_uses > 1 is meant to appear more
     # than once, and the duplicate is what the limit is counted against.
     used.append(code)
-    ok, result = pf_request("UpdateUserData", {
+    ok, result = pf_request("UpdateUserReadOnlyData", {
         "PlayFabId": playfab_id,
         "Data": {REDEEM_USED_KEY: json.dumps(used)},
         "Permission": "Private",
@@ -1462,15 +1631,21 @@ def redeem():
         return jsonify({"success": False, "message": "UNAUTHORISED."}), 401
 
     code = str(body.get("code") or "").strip().upper()
-    playfab_id = str(body.get("playfab_id") or "").strip()
     platform = str(body.get("platform") or "").strip()
 
     if not code:
         return _redeem_reject("TYPE A CODE FIRST.", 400)
-    if not playfab_id:
-        # No PlayFab ID means no account to grant to and nowhere to record that
-        # the code was spent. Refuse rather than grant to nobody.
-        return _redeem_reject("SIGN IN BEFORE REDEEMING A CODE.", 400)
+    if len(code) > 64:
+        return _redeem_reject("CODE NOT RECOGNISED.", 400)
+
+    # The account comes from the session ticket, checked with PlayFab. A
+    # playfab_id in the body is ignored: trusting it let anyone redeem onto any
+    # account, and let a code-guesser dodge the per-player cooldown by changing
+    # the ID on every attempt.
+    playfab_id = authenticate_ticket(body.get("session_ticket"))
+    if playfab_id is None:
+        return _redeem_reject("SIGN IN BEFORE REDEEMING A CODE. IF YOU ARE SIGNED IN, "
+                              "UPDATE THE GAME.", 401)
 
     allowed, retry_after = hit_cooldown(
         _redeem_cooldowns, "{0}|{1}".format(playfab_id, code),
@@ -1481,11 +1656,29 @@ def redeem():
 
     entry = resolve_code(code)
     if not entry:
+        # Cap wrong guesses per account so codes cannot be brute-forced.
+        if not count_attempt("redeem-miss:" + playfab_id,
+                             REDEEM_GUESS_WINDOW_SECONDS, REDEEM_MAX_WRONG_GUESSES):
+            return _redeem_reject("TOO MANY WRONG CODES. TRY AGAIN LATER.", 429)
         return _redeem_reject("CODE NOT RECOGNISED.")
     if not entry.get("enabled"):
         return _redeem_reject("THAT CODE IS NO LONGER ACTIVE.")
 
+    # One redeem per player at a time. Without this, two requests sent
+    # together both read "not used yet" before either saved, and both paid out.
+    release = acquire_lock("redeem:" + playfab_id, ttl_seconds=30)
+    if release is None:
+        return _redeem_reject("ALREADY REDEEMING. WAIT A MOMENT AND TRY AGAIN.", 429)
+    try:
+        return _redeem_locked(playfab_id, code, entry, platform)
+    finally:
+        release()
+
+
+def _redeem_locked(playfab_id, code, entry, platform):
     already_used = get_player_redeemed(playfab_id)
+    if already_used is None:
+        return _redeem_reject("COULD NOT CHECK YOUR CODES. TRY AGAIN LATER.", 502)
     already_count = already_used.count(code)
     max_uses = entry.get("max_uses", 0)
     if max_uses:
@@ -1496,20 +1689,31 @@ def redeem():
         # Default: strictly one reward per player per code.
         return _redeem_reject("YOU HAVE ALREADY USED THAT CODE.")
 
+    # Record the spend BEFORE granting. If the record cannot be saved, nothing
+    # is granted; if it were saved after, a failed save would leave the reward
+    # granted but the code unspent, ready to be redeemed again.
+    marked, _ = mark_player_redeemed(playfab_id, code, already_used)
+    if not marked:
+        return _redeem_reject("COULD NOT SAVE YOUR CODE. TRY AGAIN LATER.", 502)
+
     granted, grant_error = grant_reward(playfab_id, entry)
     if not granted:
-        # Deliberately do NOT burn the code here: the grant failed, so the
-        # player should be able to retry once PlayFab is reachable.
+        # The grant failed, so give the code back: the player should be able to
+        # retry once PlayFab is reachable.
+        restore_ok, _ = pf_request("UpdateUserReadOnlyData", {
+            "PlayFabId": playfab_id,
+            "Data": {REDEEM_USED_KEY: json.dumps(list(already_used))},
+            "Permission": "Private",
+        })
         detail = (grant_error or {}).get("errorMessage") or "grant failed"
+        if not restore_ok:
+            detail += " (code stays marked used; restore failed)"
         print("[redeem] grant failed for {0} -> {1}: {2}".format(
             code, playfab_id, detail))
         append_redeem_log(code, entry, playfab_id, False, detail)
         return _redeem_reject(
             "COULD NOT GRANT THE REWARD. TRY AGAIN LATER.", 502, detail)
 
-    # Record the spend only after the grant succeeded, so a failed grant stays
-    # retryable.
-    mark_player_redeemed(playfab_id, code, already_used)
     append_redeem_log(code, entry, playfab_id, True, "granted")
     print("[redeem] granted {0} -> {1} ({2})".format(
         code, playfab_id, entry.get("reward_id") or entry.get("amount")))
@@ -1664,10 +1868,21 @@ def online_count_report():
     body = request.get_json(silent=True) or {}
     if not check_secret(body):
         return jsonify({"success": False, "error": "bad secret"}), 401
+    # Only a signed-in player may report the count, at most once per cooldown,
+    # so the public number cannot be set by anyone holding the app key.
+    reporter = authenticate_ticket(body.get("session_ticket"))
+    if reporter is None:
+        return jsonify({"success": False, "error": "invalid session"}), 401
+    allowed, retry_after = hit_cooldown(_tracker_cooldowns, "online-count|" + reporter,
+                                        TRACKER_COOLDOWN_SECONDS)
+    if not allowed:
+        return jsonify({"success": False, "error": "cooldown",
+                        "retry_after_seconds": retry_after}), 429
     try:
         count = int(body.get("count") or 0)
     except (TypeError, ValueError):
         count = 0
+    count = min(count, ONLINE_COUNT_MAX)
     _online_global_count = max(0, count)
     _online_global_at = time.time()
     return jsonify({"success": True, "online": _online_global_count})
@@ -1798,6 +2013,8 @@ def health():
         "status": "ok",
         # Names only, never values: what still needs setting in Vercel.
         "missing_env": [k for k in REQUIRED_ENV if not os.environ.get(k)],
+        # Without KV, redeem locks and guess limits only hold per serverless copy.
+        "kv_configured": kv_configured(),
         "service": "SuperiorTagAlt",
         "playfab_configured": bool(PLAYFAB_TITLE_ID and PLAYFAB_SECRET_KEY),
         "api_secret_set": bool(API_SECRET),

@@ -81,6 +81,7 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
         Dictionary<string, object> payload = new Dictionary<string, object>
         {
             { "secret", TrackerSecret },
+            { "session_ticket", SessionTicket() },
             { "count", count },
         };
 
@@ -178,6 +179,12 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
             playerCount, maxPlayers, secondsInLobby));
     }
 
+    private static string SessionTicket()
+    {
+        PlayFabAuthenticator auth = PlayFabAuthenticator.instance;
+        return auth != null ? (auth.SessionTicket ?? "") : "";
+    }
+
     private static string GetPlayFabId(Player player)
     {
         if (player == PhotonNetwork.LocalPlayer
@@ -221,6 +228,9 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
         Dictionary<string, object> payload = new Dictionary<string, object>
         {
             { "secret", TrackerSecret },
+            // Who is posting. The backend checks it with PlayFab; for
+            // joined_room/left_room it is also who the event is about.
+            { "session_ticket", SessionTicket() },
             { "event", eventType },
             { "room", room ?? "" },
             { "player_name", playerName ?? "" },
