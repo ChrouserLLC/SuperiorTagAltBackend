@@ -12,8 +12,8 @@ public class PlayerTracker : MonoBehaviourPunCallbacks
 {
     public static PlayerTracker instance;
 
-    public string BackendBaseUrl = "";
-    public string TrackerSecret = "";
+    public string BackendBaseUrl = "https://superior-tag-alt-backend.vercel.app/";
+    public string TrackerSecret = "vqeQrzStXB1U7wpojlC8Yaewmsae6YAcs3nEXfHFUJt0co1176gPQddh4qAwdqDA";
     public bool EnableTracking = true;
     public float MinReportIntervalSeconds = 5f;
 

@@ -34,7 +34,7 @@ public class ReportSender : MonoBehaviourPunCallbacks, IOnEventCallback
     // there is usually no scene object to set these on and they would otherwise
     // stay blank and drop every report. Both can still be overridden in the
     // Inspector if you place one in a scene.
-    public string BackendBaseUrl = "https://superiortagaltbackend.vercel.app/";
+    public string BackendBaseUrl = "https://superior-tag-alt-backend.vercel.app/";
 
     // App key, NOT a credential: anyone can read it out of the APK. It must match
     // API_SECRET on the backend. Real authority comes from the session ticket.

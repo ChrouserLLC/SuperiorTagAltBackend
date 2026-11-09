@@ -15,7 +15,7 @@ Run:   start_bot.bat        (Windows, installs what it needs)
 Settings (env vars, or lines NAME=value in private/vercel-env-values.txt):
   DISCORD_BOT_TOKEN   the bot token
   ADMIN_SECRET        same value as on Vercel (authorises the relay)
-  BACKEND_URL         default https://superiortagaltbackend.vercel.app
+  BACKEND_URL         default https://superior-tag-alt-backend.vercel.app
 """
 import asyncio
 import json
@@ -58,7 +58,7 @@ def setting(name, default=""):
 
 TOKEN = setting("DISCORD_BOT_TOKEN")
 RELAY_KEY = setting("ADMIN_SECRET")
-BACKEND = setting("BACKEND_URL", "https://superiortagaltbackend.vercel.app").rstrip("/")
+BACKEND = setting("BACKEND_URL", "https://superior-tag-alt-backend.vercel.app").rstrip("/")
 
 
 class Bot(discord.Client):

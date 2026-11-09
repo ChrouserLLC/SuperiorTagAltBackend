@@ -115,7 +115,13 @@ Unity/ReportSender.cs    ->  Assets/Scripts/Reports/ReportSender.cs
 Unity/PlayerTracker.cs   ->  Assets/Scripts/PlayerTracker/PlayerTracker.cs
 ```
 
-Both are already installed in `C:\Projects\SuperiorTag`.
+The canonical copies of both scripts live in the game project
+(`Assets/!Superior!/Moderation/Reports/`). The two files in `Unity/` here are
+mirrors, kept in sync so you can read them without opening Unity: copy FROM the
+game project TO here if you change the client, never the other way round. The
+base URL is the KV-enabled deployment (`superior-tag-alt-backend.vercel.app`);
+the un-hyphenated `superiortagaltbackend.vercel.app` is a second deployment with
+KV disabled, so cooldowns and redeem locks there only hold per instance.
 
 `ReportSender` auto-creates itself via `EnsureCreated()`, so you only need to
 set `ReportSecret` on the component if you place one in a scene. Leave

@@ -143,7 +143,10 @@ REPORT_REASONS = {
     "Bullying": "Bullying",
     "Doxing": "Doxing",
     "Impersonation": "Impersonation",
+    # Sent by the game's own anti-cheat (GorillaNot), not a player. Never insta-bans.
+    "AutoDetected": "Auto Anti-Cheat",
 }
+AUTO_REASONS = {"AutoDetected"}
 
 REPORT_COLORS = {
     "Cheating": 0xFF453A,
@@ -152,6 +155,7 @@ REPORT_COLORS = {
     "Bullying": 0xFFD60A,
     "Doxing": 0xFF2D55,
     "Impersonation": 0x64D2FF,
+    "AutoDetected": 0x8E8E93,
 }
 
 MAP_NAMES = {
@@ -509,7 +513,7 @@ def build_tracker_embed(event, room, player_count, max_players, player_name,
 
 def build_report_embed(reason, room_code, is_private, game_mode, scene, map_label,
                        reporter_name, reporter_id, reported_name, reported_id,
-                       room_count=None):
+                       room_count=None, detail=""):
     reason_label = REPORT_REASONS.get(reason, reason or "Unknown")
     visibility = "Private" if is_private else "Public"
     if room_code == "-PRIVATE-":
@@ -520,6 +524,9 @@ def build_report_embed(reason, room_code, is_private, game_mode, scene, map_labe
 
     description = "**{0}** reported **{1}** for **{2}**".format(
         reporter_name or "Unknown", reported_name or "Unknown", reason_label)
+    if reason in AUTO_REASONS:
+        description = "Anti-cheat on **{0}**'s game flagged **{1}**".format(
+            reporter_name or "Unknown", reported_name or "Unknown")
 
     fields = [
         {"name": "Reported Player", "value": (reported_name or "Unknown")[:100], "inline": True},
@@ -530,6 +537,8 @@ def build_report_embed(reason, room_code, is_private, game_mode, scene, map_labe
         {"name": "Visibility", "value": visibility, "inline": True},
         {"name": "Room Code", "value": "`{0}`".format(room_code[:50]), "inline": False},
     ]
+    if detail:
+        fields.insert(3, {"name": "Detected", "value": detail[:200], "inline": False})
     if game_mode:
         fields.append({"name": "Game Mode", "value": game_mode, "inline": True})
     if map_label:
@@ -539,7 +548,7 @@ def build_report_embed(reason, room_code, is_private, game_mode, scene, map_labe
                    "inline": True})
 
     return {"embeds": [{
-        "title": "New Player Report",
+        "title": "Anti-Cheat Flag" if reason in AUTO_REASONS else "New Player Report",
         "description": description,
         "color": REPORT_COLORS.get(reason, 0xFF453A),
         "fields": fields[:25],
@@ -893,6 +902,7 @@ def report():
     claimed_reporter_id = (body.get("reporter_id") or "").strip()
     reported_name = (body.get("reported_name") or "").strip()
     reported_id = (body.get("reported_id") or "").strip()
+    detail = (body.get("detail") or "").strip()[:200]
 
     if not reason or reason not in REPORT_REASONS:
         return jsonify({"success": False, "error": "invalid reason"}), 400
@@ -928,7 +938,10 @@ def report():
     # Insta-ban first so the report embed can note the outcome. Only a
     # PlayFab-verified reporter is ever passed on; the CloudScript then checks
     # that verified ID against its allowlist.
-    if reporter_verified:
+    if reason in AUTO_REASONS:
+        instaban = {"checked": False, "banned": False,
+                    "reason": "automatic flags never ban"}
+    elif reporter_verified:
         instaban = run_instaban(reporter_id, reported_id, reason)
     else:
         instaban = {"checked": False, "banned": False,
@@ -940,7 +953,7 @@ def report():
         (claimed_reporter_id + " (unverified)") if claimed_reporter_id else "(unverified)")
     payload = build_report_embed(reason, room_code, is_private, game_mode, scene,
                                  map_label, reporter_name, shown_reporter_id,
-                                 reported_name, reported_id, room_count)
+                                 reported_name, reported_id, room_count, detail)
     # Through the Discord bot (with Ban/Dismiss buttons) when it is configured,
     # otherwise the plain webhook as before.
     sent, err = discord_bot.post_report(payload, reported_id,
