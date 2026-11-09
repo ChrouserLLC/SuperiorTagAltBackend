@@ -94,7 +94,7 @@ Verify with `GET /api/health` — it reports which of these are configured.
 ### 2. Register the CloudScript
 
 PlayFab Dashboard > your title > **Automation > CloudScript** > upload
-`C:\Projectsackends\CloudScript.js` (the one CloudScript for the whole game; it lives outside this repo).
+`C:\Projectsbackends\CloudScript.js` (the one CloudScript for the whole game; it lives outside this repo).
 
 Then edit two things in that file before going live:
 
