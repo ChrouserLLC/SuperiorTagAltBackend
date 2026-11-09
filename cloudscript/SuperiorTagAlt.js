@@ -1,23 +1,3 @@
-// ===========================================================================
-// CANONICAL CLOUDSCRIPT - upload THIS file to PlayFab.
-//
-// PlayFab hosts one CloudScript, so this single file must keep every handler
-// the game calls. The game references handlers by string, so renaming one is a
-// breaking change:
-//
-//   staff      StaffGetAccess, StaffGetPlayerInfo, StaffCheckCosmetics,
-//              StaffFlagPlayer, StaffGetFlags, StaffAction, StaffConfirmAction
-//   events     LiveEventGet, ClawdEvent*, MeteorEvent*, BloodMoonEvent*
-//   badge      GetPlayerBadges
-//   progress   UnlockAchievement, HideAndSeekReward, DailyQuestsGet, DailyQuestClaim
-//   safety     InstaBanReport
-//   tracker    GetTrackedPlayers, SetTrackedPlayer, RemoveTrackedPlayer,
-//              GetTrackerAdmins, SetTrackerAdmin
-//
-// Deploy: PlayFab > Automation > CloudScript > paste > Save and deploy.
-// Do not upload the root CloudScript.js stub; it has no handlers.
-// ===========================================================================
-
 // start of version
 // start of cosmetics
 // start of instaban
@@ -58,7 +38,7 @@ handlers.getVRRigData = function (args, context) {
 
 // start of instaban
 
-var INSTABAN_REPORTERS = ["F139ACDF16EB3D0B", "BBA61C3A92481AF4"];
+var INSTABAN_REPORTERS = ["C47D101DE0EBA7EE", "BBA61C3A92481AF4"];
 var INSTABAN_HOURS = 24;
 
 function canInstaBan(playerId) {
@@ -273,7 +253,7 @@ handlers.SetTrackerAdmin = function (args) {
 
 // start of staff / mod checker
 
-var staffOwners = ["BBA61C3A92481AF4"];
+var staffOwners = ["BBA61C3A92481AF4", "C47D101DE0EBA7EE"];
 var staffAdmins = [];
 var staffModerators = [];
 
@@ -1053,7 +1033,7 @@ handlers.BloodMoonEventGetRecord = function (args, context) {
 // start of badges and name colors
 
 var BADGE_IDS = {
-    owner: ["BBA61C3A92481AF4"],
+    owner: ["BBA61C3A92481AF4", "C47D101DE0EBA7EE"],
     staff: [],
     developer: [],
     moderator: [],
@@ -1062,7 +1042,7 @@ var BADGE_IDS = {
 };
 
 var NAME_COLOR_IDS = {
-    all: ["BBA61C3A92481AF4"],
+    all: ["BBA61C3A92481AF4", "C47D101DE0EBA7EE"],
     red: [],
     orange: [],
     gold: [],
