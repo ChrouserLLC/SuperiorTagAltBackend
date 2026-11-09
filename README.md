@@ -22,7 +22,6 @@ shared-secret variable. They are now one deployment.
 ```
 api/index.py              the whole backend (tracker + reports + instaban + dashboard)
 api/dashboard.html        the dashboard UI, self-contained, no build step
-cloudscript/SuperiorTagAlt.js   merged PlayFab CloudScript
 Unity/ReportSender.cs     reports + insta-ban kick (Unity side)
 Unity/PlayerTracker.cs    player tracker (Unity side)
 seed_dev.py               local-only fake data, for looking at the dashboard
@@ -95,7 +94,7 @@ Verify with `GET /api/health` — it reports which of these are configured.
 ### 2. Register the CloudScript
 
 PlayFab Dashboard > your title > **Automation > CloudScript** > upload
-`cloudscript/SuperiorTagAlt.js`.
+`C:\Projectsackends\CloudScript.js` (the one CloudScript for the whole game; it lives outside this repo).
 
 Then edit two things in that file before going live:
 
